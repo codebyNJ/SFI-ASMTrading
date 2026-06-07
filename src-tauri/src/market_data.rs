@@ -1,0 +1,188 @@
+//! Real company market data from Yahoo Finance (daily closes).
+//!
+//! In the Path-3 sandbox this real price series *drives* the simulation: it plays
+//! forward day by day and the agents react to it. We fetch live (no API key, just
+//! a browser User-Agent) and fall back to a bundled snapshot when offline.
+
+use std::time::Duration;
+
+use serde::Serialize;
+use serde_json::Value;
+
+/// Offline fallback (Apple, ~5y daily) so the app always has a series to play.
+const BUNDLED_AAPL: &str = include_str!("../resources/stock_aapl.json");
+const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
+
+#[derive(Serialize, Clone)]
+pub struct MarketSeries {
+    pub symbol: String,
+    pub name: String,
+    /// "yahoo" | "bundled"
+    pub source: String,
+    pub days: usize,
+    pub last_price: f64,
+    /// Unix-second timestamps aligned with `prices`.
+    pub timestamps: Vec<i64>,
+    /// Daily closing prices — the series the sandbox plays forward.
+    pub prices: Vec<f64>,
+    pub returns: Vec<f64>,
+    /// Daily log-return std.
+    pub ret_std: f64,
+    /// Annualized volatility (ret_std * sqrt(252) for trading days).
+    pub annual_vol: f64,
+    /// Excess kurtosis of daily returns (fat tails > 0).
+    pub kurtosis: f64,
+    /// Lag-1 autocorrelation of |returns| (volatility clustering).
+    pub abs_ac1: f64,
+    pub ret_hist: Vec<u32>,
+    pub ret_hist_lo: f64,
+    pub ret_hist_hi: f64,
+}
+
+fn http_get(url: &str) -> Option<String> {
+    ureq::get(url)
+        .set("User-Agent", UA)
+        .timeout(Duration::from_secs(20))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()
+}
+
+/// Parse Yahoo's chart JSON into (timestamps, closes), dropping null gaps.
+fn parse_yahoo(body: &str) -> Option<(String, Vec<i64>, Vec<f64>)> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let result = v.get("chart")?.get("result")?.get(0)?;
+    let symbol = result
+        .get("meta")
+        .and_then(|m| m.get("symbol"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ts = result.get("timestamp")?.as_array()?;
+    let close = result.get("indicators")?.get("quote")?.get(0)?.get("close")?.as_array()?;
+
+    let mut times = Vec::with_capacity(ts.len());
+    let mut closes = Vec::with_capacity(ts.len());
+    for (t, c) in ts.iter().zip(close.iter()) {
+        if let (Some(ti), Some(ci)) = (t.as_i64(), c.as_f64()) {
+            if ci.is_finite() && ci > 0.0 {
+                times.push(ti);
+                closes.push(ci);
+            }
+        }
+    }
+    (closes.len() >= 60).then_some((symbol, times, closes))
+}
+
+/// Parse the bundled `{symbol,name,t:[],c:[]}` snapshot.
+fn parse_bundled() -> Option<(String, String, Vec<i64>, Vec<f64>)> {
+    let v: Value = serde_json::from_str(BUNDLED_AAPL).ok()?;
+    let symbol = v.get("symbol")?.as_str()?.to_string();
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+    let t: Vec<i64> = v.get("t")?.as_array()?.iter().filter_map(|x| x.as_i64()).collect();
+    let c: Vec<f64> = v.get("c")?.as_array()?.iter().filter_map(|x| x.as_f64()).collect();
+    Some((symbol, name, t, c))
+}
+
+/// Load a daily series for `symbol`, live from Yahoo with a bundled fallback.
+pub fn load(symbol: &str) -> MarketSeries {
+    let sym = symbol.trim().to_uppercase();
+    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5y&interval=1d");
+    if let Some((ysym, t, c)) = http_get(&url).and_then(|b| parse_yahoo(&b)) {
+        let name = if ysym.is_empty() { sym.clone() } else { ysym };
+        return compute(&sym, &name, "yahoo", t, c);
+    }
+    if let Some((bsym, bname, t, c)) = parse_bundled() {
+        return compute(&bsym, &bname, "bundled", t, c);
+    }
+    compute(&sym, &sym, "bundled", Vec::new(), Vec::new())
+}
+
+fn compute(symbol: &str, name: &str, source: &str, timestamps: Vec<i64>, prices: Vec<f64>) -> MarketSeries {
+    let mut returns = Vec::new();
+    for w in prices.windows(2) {
+        returns.push((w[1] / w[0]).ln());
+    }
+
+    let n = returns.len().max(1) as f64;
+    let mean = returns.iter().sum::<f64>() / n;
+    let (mut m2, mut m4) = (0.0, 0.0);
+    for &r in &returns {
+        let d = r - mean;
+        m2 += d * d;
+        m4 += d * d * d * d;
+    }
+    let var = m2 / n;
+    let std = var.sqrt();
+    let kurtosis = if var > 1e-300 { (m4 / n) / (var * var) - 3.0 } else { 0.0 };
+
+    let abs_ac1 = abs_lag1(&returns);
+
+    let bins = 41usize;
+    let hi = returns.iter().fold(0.0_f64, |a, &b| a.max(b.abs())).max(1e-6);
+    let lo = -hi;
+    let mut ret_hist = vec![0u32; bins];
+    for &r in &returns {
+        let idx = (((r - lo) / (hi - lo)) * bins as f64).floor() as isize;
+        ret_hist[idx.clamp(0, bins as isize - 1) as usize] += 1;
+    }
+
+    MarketSeries {
+        symbol: symbol.to_string(),
+        name: name.to_string(),
+        source: source.to_string(),
+        days: prices.len(),
+        last_price: prices.last().copied().unwrap_or(0.0),
+        timestamps,
+        prices,
+        returns,
+        ret_std: std,
+        annual_vol: std * 252.0_f64.sqrt(),
+        kurtosis,
+        abs_ac1,
+        ret_hist,
+        ret_hist_lo: lo,
+        ret_hist_hi: hi,
+    }
+}
+
+fn abs_lag1(returns: &[f64]) -> f64 {
+    if returns.len() < 2 {
+        return 0.0;
+    }
+    let n = returns.len() as f64;
+    let mean = returns.iter().map(|r| r.abs()).sum::<f64>() / n;
+    let mut var = 0.0;
+    for &r in returns {
+        let d = r.abs() - mean;
+        var += d * d;
+    }
+    var /= n;
+    if var <= 1e-300 {
+        return 0.0;
+    }
+    let mut cov = 0.0;
+    for i in 1..returns.len() {
+        cov += (returns[i].abs() - mean) * (returns[i - 1].abs() - mean);
+    }
+    cov / n / var
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_series_parses_and_has_sensible_stats() {
+        let (sym, _name, t, c) = parse_bundled().expect("bundled snapshot should parse");
+        assert_eq!(sym, "AAPL");
+        assert!(c.len() > 500, "expected a long history, got {}", c.len());
+        assert_eq!(t.len(), c.len());
+        let m = compute("AAPL", "Apple Inc.", "bundled", t, c);
+        assert!(m.ret_std > 0.001 && m.ret_std < 0.2, "daily vol {}", m.ret_std);
+        assert!(m.kurtosis.is_finite());
+        assert_eq!(m.prices.len(), m.days);
+        assert!(m.last_price > 0.0);
+    }
+}

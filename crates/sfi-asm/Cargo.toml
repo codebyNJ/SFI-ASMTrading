@@ -1,0 +1,20 @@
+[package]
+name = "sfi-asm"
+version = "0.1.0"
+edition = "2021"
+description = "Santa Fe Institute Artificial Stock Market core engine with a network-coupling extension"
+
+[lib]
+name = "sfi_asm"
+path = "src/lib.rs"
+
+# Pure-Rust, zero external dependencies in Phase 1 so the simulation is fully
+# deterministic and reproducible (our own seeded PRNG, no crate version drift).
+
+[[example]]
+name = "run"
+path = "examples/run.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
