@@ -32,11 +32,7 @@ pub fn clear(forecasts: &[Forecast], d: f64, p: &Params, prev_price: f64) -> Cle
         known += w * (a * d + b);
     }
 
-    let raw = if denom.abs() < 1e-9 {
-        prev_price
-    } else {
-        (total_supply - known) / denom
-    };
+    let raw = if denom.abs() < 1e-9 { prev_price } else { (total_supply - known) / denom };
     let price = if raw.is_finite() { raw.clamp(0.01, p.max_price) } else { prev_price };
 
     let demands = forecasts
@@ -67,11 +63,7 @@ mod tests {
         for &d in &[8.0, 10.0, 12.5] {
             let clearing = clear(&forecasts, d, &p, ree.price(d));
             let expected = ree.price(d);
-            assert!(
-                (clearing.price - expected).abs() < 1e-6,
-                "d={d}: cleared {} vs REE {expected}",
-                clearing.price
-            );
+            assert!((clearing.price - expected).abs() < 1e-6, "d={d}: cleared {} vs REE {expected}", clearing.price);
             // Demands should each be ~1 (symmetric one-share holding) and sum to N.
             let sum: f64 = clearing.demands.iter().sum();
             assert!((sum - p.n_agents as f64).abs() < 1e-6, "demand sum {sum}");

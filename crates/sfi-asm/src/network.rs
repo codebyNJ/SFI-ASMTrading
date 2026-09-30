@@ -13,9 +13,10 @@
 use crate::rng::Rng;
 
 /// Which network wiring to use, with its structural parameter.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Topology {
     /// No links — agents learn purely individually.
+    #[default]
     None,
     /// Ring lattice where each node connects to its `k` nearest neighbors (k even).
     Lattice { k: usize },
@@ -23,12 +24,6 @@ pub enum Topology {
     Random { mean_degree: f64 },
     /// Barabási–Albert scale-free graph; each new node attaches `m` edges.
     ScaleFree { m: usize },
-}
-
-impl Default for Topology {
-    fn default() -> Self {
-        Topology::None
-    }
 }
 
 /// Undirected graph stored as per-node neighbor lists.
@@ -135,11 +130,7 @@ fn scale_free(n: usize, m: usize, rng: &mut Rng) -> Vec<Vec<usize>> {
         let mut guard = 0;
         while chosen.len() < m && guard < 20 * m + 20 {
             guard += 1;
-            let t = if repeated.is_empty() {
-                rng.below(v)
-            } else {
-                repeated[rng.below(repeated.len())]
-            };
+            let t = if repeated.is_empty() { rng.below(v) } else { repeated[rng.below(repeated.len())] };
             if t != v && !chosen.contains(&t) {
                 chosen.push(t);
             }
