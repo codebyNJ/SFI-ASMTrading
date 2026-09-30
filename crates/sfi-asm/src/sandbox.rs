@@ -50,6 +50,10 @@ pub struct SandboxParams {
     pub init_var: f64,
     pub topology: Topology,
     pub seed: u64,
+    /// Round-trip friction charged on turnover, in basis points of the traded
+    /// notional (`|position_today - position_yesterday| * cost_bps / 1e4`).
+    /// 0 keeps the classic frictionless behaviour.
+    pub cost_bps: f64,
 }
 
 impl Default for SandboxParams {
@@ -67,6 +71,7 @@ impl Default for SandboxParams {
             init_var: 4e-4,
             topology: Topology::ScaleFree { m: 2 },
             seed: 42,
+            cost_bps: 0.0,
         }
     }
 }
@@ -229,6 +234,9 @@ pub struct Outcomes {
     /// How one-sided the crowd is: 0 = evenly split, 1 = everyone same way.
     pub herding: f64,
     pub avg_wealth: f64,
+    /// Wealth of a passive buy-and-hold investor who started with `init_wealth`
+    /// on the same days the town traded — the baseline any strategy must beat.
+    pub benchmark_wealth: f64,
     pub cohort_names: Vec<String>,
     pub cohort_wealth: Vec<f64>,
 }
@@ -241,6 +249,8 @@ pub struct Sandbox {
     pub day: u64,
     pub traders: Vec<Trader>,
     pub network: Network,
+    /// Buy-and-hold baseline, compounded on exactly the days traders settle.
+    pub benchmark_wealth: f64,
     rng: Rng,
 }
 
@@ -254,7 +264,8 @@ impl Sandbox {
             }
         }
         let network = Network::build(traders.len(), params.topology, &mut rng);
-        Self { params, cohorts, prices, idx: 0, day: 0, traders, network, rng }
+        let benchmark_wealth = params.init_wealth;
+        Self { params, cohorts, prices, idx: 0, day: 0, traders, network, benchmark_wealth, rng }
     }
 
     /// Advance one trading day: forecast -> position -> realize -> learn -> evolve.
@@ -264,9 +275,18 @@ impl Sandbox {
             return;
         }
         let p = self.prices[self.idx];
-        let next_idx = if self.idx + 1 < n { self.idx + 1 } else { 0 };
+        let wraps = self.idx + 1 >= n;
+        let next_idx = if wraps { 0 } else { self.idx + 1 };
         let p_next = self.prices[next_idx];
-        if p <= 0.0 || p_next <= 0.0 {
+        // The loop seam (last day -> first day) is not a real market move: the
+        // "return" p[0]/p[n-1] is years of drift in one step. Settling or learning
+        // on it would hand every trader a fake crash/boom, so the town sits out
+        // that day and flattens its book.
+        if wraps || p <= 0.0 || p_next <= 0.0 {
+            for t in &mut self.traders {
+                t.position = 0.0;
+                t.last_pnl = 0.0;
+            }
             self.idx = next_idx;
             self.day += 1;
             return;
@@ -277,6 +297,8 @@ impl Sandbox {
         let state = state_bits(&self.prices, self.idx);
         let momentum = mean_return_k(&self.prices, self.idx, 5);
         let sigma = sigma_recent(&self.prices, self.idx, 20).max(0.005);
+        let cost_rate = self.params.cost_bps.max(0.0) * 1e-4;
+        self.benchmark_wealth *= 1.0 + simple;
 
         for trader in &mut self.traders {
             let cohort = &self.cohorts[trader.cohort];
@@ -290,10 +312,11 @@ impl Sandbox {
             trader.active_mask = ridx.map(|i| trader.rules[i].mask).unwrap_or(0);
             // Bet sized by forecast / recent volatility, scaled by cohort risk.
             let pos = (cohort.risk * r_hat / sigma).clamp(-self.params.max_leverage, self.params.max_leverage);
+            let turnover = (pos - trader.position).abs();
             trader.position = pos;
 
-            // Realize P&L on the day's actual move.
-            trader.last_pnl = pos * simple;
+            // Realize P&L on the day's actual move, net of trading friction.
+            trader.last_pnl = pos * simple - cost_rate * turnover;
             trader.wealth = (trader.wealth * (1.0 + trader.last_pnl)).max(1e-6);
 
             // Learn: update every rule that matched today against the real move.
@@ -313,15 +336,33 @@ impl Sandbox {
             return;
         }
         // Snapshot rule pools so neighbours are read from one consistent state.
-        let snapshot: Vec<Vec<Rule>> = self.traders.iter().map(|t| t.rules.clone()).collect();
+        // GA turns are staggered, so only a few traders evolve on any given day:
+        // copy just their pools and their neighbours' instead of the whole town.
+        // (Iteration order is unchanged, so results are bit-identical.)
+        let mut snapshot: Vec<Option<Vec<Rule>>> = vec![None; self.traders.len()];
+        for i in 0..self.traders.len() {
+            if day < self.traders[i].next_ga {
+                continue;
+            }
+            for &j in std::iter::once(&i).chain(self.network.neighbors(i)) {
+                if snapshot[j].is_none() {
+                    snapshot[j] = Some(self.traders[j].rules.clone());
+                }
+            }
+        }
         for i in 0..self.traders.len() {
             if day < self.traders[i].next_ga {
                 continue;
             }
             let herding = self.cohorts[self.traders[i].cohort].herding;
-            let nbrs: Vec<usize> = self.network.neighbors(i).to_vec();
-            let pools: Vec<&[Rule]> = nbrs.iter().map(|&j| snapshot[j].as_slice()).collect();
-            run_ga(&mut self.traders[i].rules, &snapshot[i], &pools, herding, &mut self.rng, &self.params);
+            let pools: Vec<&[Rule]> = self
+                .network
+                .neighbors(i)
+                .iter()
+                .filter_map(|&j| snapshot[j].as_deref())
+                .collect();
+            let own = snapshot[i].as_deref().unwrap_or(&[]);
+            run_ga(&mut self.traders[i].rules, own, &pools, herding, &mut self.rng, &self.params);
             self.traders[i].next_ga = day + self.params.ga_interval;
         }
     }
@@ -354,6 +395,7 @@ impl Sandbox {
             sentiment: longs / n,
             herding: (sign_sum / n).abs(),
             avg_wealth,
+            benchmark_wealth: self.benchmark_wealth,
             cohort_names: self.cohorts.iter().map(|c| c.name.clone()).collect(),
             cohort_wealth,
         }
@@ -466,7 +508,8 @@ fn run_ga(
     }
 
     let mut order: Vec<usize> = (0..m).collect();
-    order.sort_by(|&i, &j| rules[i].fitness.partial_cmp(&rules[j].fitness).unwrap());
+    // total_cmp: a NaN fitness must not panic the whole run mid-GA.
+    order.sort_by(|&i, &j| rules[i].fitness.total_cmp(&rules[j].fitness));
     for (k, child) in children.into_iter().enumerate() {
         rules[order[k]] = child;
     }
@@ -585,5 +628,57 @@ mod tests {
         let o = s.outcomes();
         assert!(o.avg_wealth > s.params.init_wealth, "avg wealth {} did not grow", o.avg_wealth);
         assert!(o.sentiment > 0.5, "crowd should lean long on an uptrend, got {}", o.sentiment);
+    }
+
+    #[test]
+    fn loop_seam_is_not_traded() {
+        // Price triples over the series, so wrapping p[n-1] -> p[0] would be a
+        // ~-67% one-day "crash" if it were settled.
+        let n = 200;
+        let prices: Vec<f64> = (0..n).map(|i| 100.0 * (1.0 + 2.0 * i as f64 / n as f64)).collect();
+        let mut s = Sandbox::new(prices, default_cohorts(), SandboxParams::default());
+        for _ in 0..(n - 1) {
+            s.step();
+        }
+        assert_eq!(s.idx, n - 1);
+        let before: Vec<f64> = s.traders.iter().map(|t| t.wealth).collect();
+        let bench_before = s.benchmark_wealth;
+        s.step(); // the seam
+        assert_eq!(s.idx, 0);
+        for (t, w) in s.traders.iter().zip(before) {
+            assert_eq!(t.wealth, w, "wealth must not move on the loop seam");
+            assert_eq!(t.position, 0.0);
+            assert_eq!(t.last_pnl, 0.0);
+        }
+        assert_eq!(s.benchmark_wealth, bench_before);
+    }
+
+    #[test]
+    fn benchmark_tracks_buy_and_hold() {
+        let n = 500;
+        let prices = uptrend(n);
+        let mut s = Sandbox::new(prices.clone(), default_cohorts(), SandboxParams::default());
+        for _ in 0..(n - 1) {
+            s.step();
+        }
+        let expected = s.params.init_wealth * prices[n - 1] / prices[0];
+        let got = s.outcomes().benchmark_wealth;
+        assert!((got / expected - 1.0).abs() < 1e-9, "benchmark {got} vs buy&hold {expected}");
+    }
+
+    #[test]
+    fn transaction_costs_only_reduce_wealth() {
+        let run = |cost_bps: f64| {
+            let params = SandboxParams { cost_bps, ..SandboxParams::default() };
+            let mut s = Sandbox::new(uptrend(800), default_cohorts(), params);
+            for _ in 0..799 {
+                s.step();
+            }
+            s.outcomes().avg_wealth
+        };
+        let free = run(0.0);
+        let costly = run(25.0);
+        assert!(costly.is_finite() && costly > 0.0);
+        assert!(costly < free, "costs should bite: {costly} vs frictionless {free}");
     }
 }

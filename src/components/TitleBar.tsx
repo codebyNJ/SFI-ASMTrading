@@ -1,8 +1,17 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, X, ArrowUp, ArrowDown } from "lucide-react";
 
-export function TitleBar(props: { name?: string; symbol?: string; day: number; days: number; price: number; change: number }) {
-  const { name, symbol, day, days, price, change } = props;
+export function TitleBar(props: {
+  name?: string;
+  symbol?: string;
+  day: number;
+  days: number;
+  price: number;
+  change: number;
+  /** Set when live data failed and a bundled series was substituted. */
+  fallbackFor?: string;
+}) {
+  const { name, symbol, day, days, price, change, fallbackFor } = props;
   const up = change >= 0;
   return (
     <div data-tauri-drag-region className="titlebar flex h-9 shrink-0 items-center justify-between px-3 select-none">
@@ -13,6 +22,14 @@ export function TitleBar(props: { name?: string; symbol?: string; day: number; d
         {name && (
           <span className="text-foreground/80">
             {name} ({symbol})
+          </span>
+        )}
+        {fallbackFor && (
+          <span
+            className="rounded-md bg-amber-100 px-1.5 py-0.5 text-[11px] font-medium text-amber-800"
+            title={`Couldn't load ${fallbackFor} (offline or unknown ticker) — showing the bundled ${symbol} sample instead.`}
+          >
+            ⚠ {fallbackFor} unavailable · offline sample
           </span>
         )}
         <span>· Day {day} / {days} ·</span>

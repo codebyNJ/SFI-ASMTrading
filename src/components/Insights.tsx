@@ -124,6 +124,12 @@ function Leaderboard(props: { snap: Snapshot | null; guilds: Guild[]; history: n
       </CardHeader>
       <CardContent className="space-y-2">
         <Sparklines history={history} colors={guilds.map((g) => g.color)} />
+        {snap && (
+          <div className="flex items-center justify-between border-b border-dashed pb-1.5 text-[12px] text-muted-foreground">
+            <span title="What you'd have by simply holding the stock over the same days">Buy &amp; hold (baseline)</span>
+            <span className="tabular-nums">{money(snap.benchmark_wealth)}</span>
+          </div>
+        )}
         {ranked.map((g) => (
           <div key={g.i} className="flex items-center justify-between text-[12px]">
             <span className="flex items-center gap-1.5">

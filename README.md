@@ -11,6 +11,7 @@ LeBaron, Palmer, Tayler 1996).
 > *why* it's buying or selling.
 
 See **[CONCEPT.md](CONCEPT.md)** for the story/metaphor
+and **[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md)** for a maturity review and roadmap.
 
 
 ---

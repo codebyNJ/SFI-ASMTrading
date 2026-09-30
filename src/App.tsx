@@ -28,6 +28,7 @@ function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [history, setHistory] = useState<number[][]>([]);
 
@@ -49,6 +50,7 @@ function App() {
     setSelected(null);
     setHistory(active.map(() => []));
     lastHistDay.current = -1;
+    setError(null);
     try {
       const cohorts = active.map((p) => ({ name: p.name, count: counts[p.key], memory: p.memory, herding: p.herding, risk: p.risk }));
       const res = await invoke<Init>("init_sandbox", { config: { symbol, cohorts, topology, degree: 6, seed } });
@@ -56,6 +58,7 @@ function App() {
       setSnap(res.snapshot);
     } catch (e) {
       console.error("init_sandbox:", e);
+      setError(String(e));
     } finally {
       setBusy(false);
     }
@@ -78,6 +81,8 @@ function App() {
         setSnap(s);
       } catch (e) {
         console.error(e);
+        setError(String(e));
+        setRunning(false);
         return;
       }
       timer = window.setTimeout(tick, 1000 / Math.max(0.2, speedRef.current));
@@ -107,7 +112,7 @@ function App() {
 
   return (
     <div className="flex h-screen flex-col">
-      <TitleBar name={init?.name} symbol={init?.symbol} day={snap ? snap.idx + 1 : 0} days={init?.days ?? 0} price={snap?.price ?? 0} change={change} />
+      <TitleBar name={init?.name} symbol={init?.symbol} day={snap ? snap.idx + 1 : 0} days={init?.days ?? 0} price={snap?.price ?? 0} change={change} fallbackFor={init?.fallback ? init.requested : undefined} />
 
       <div className="flex min-h-0 flex-1">
         {/* Town */}
@@ -145,6 +150,8 @@ function App() {
                   {running ? "Pause" : "Run"}
                 </Button>
               </div>
+
+              {error && <p className="rounded-md bg-red-50 px-2 py-1 text-[11px] text-red-700">{error}</p>}
 
               <LabeledSlider label="Speed (days / sec)" value={speed} min={0.3} max={6} step={0.1} onChange={setSpeed} />
 

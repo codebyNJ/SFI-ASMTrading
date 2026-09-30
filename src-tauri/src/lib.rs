@@ -324,6 +324,9 @@ struct SandboxCfg {
     degree: Option<f64>,
     #[serde(default)]
     seed: Option<u64>,
+    /// Trading friction in basis points of turnover (default 0 = frictionless).
+    #[serde(default)]
+    cost_bps: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -353,6 +356,8 @@ struct SandboxSnapshot {
     sentiment: f64,
     herding: f64,
     avg_wealth: f64,
+    /// Passive buy-and-hold wealth over the same trading days (the baseline).
+    benchmark_wealth: f64,
     cohort_names: Vec<String>,
     cohort_wealth: Vec<f64>,
     traders: Vec<TraderView>,
@@ -383,6 +388,9 @@ struct SandboxInit {
     symbol: String,
     name: String,
     source: String,
+    /// Ticker the user asked for; differs from `symbol` on offline fallback.
+    requested: String,
+    fallback: bool,
     days: usize,
     prices: Vec<f64>,
     timestamps: Vec<i64>,
@@ -399,6 +407,9 @@ fn sandbox_params(cfg: &SandboxCfg) -> SandboxParams {
     }
     if let Some(s) = cfg.seed {
         p.seed = s;
+    }
+    if let Some(c) = cfg.cost_bps {
+        p.cost_bps = c.clamp(0.0, 500.0);
     }
     let deg = cfg.degree.unwrap_or(6.0);
     p.topology = match cfg.topology.as_deref() {
@@ -456,6 +467,7 @@ fn sandbox_snapshot(s: &Sandbox) -> SandboxSnapshot {
         sentiment: o.sentiment,
         herding: o.herding,
         avg_wealth: o.avg_wealth,
+        benchmark_wealth: o.benchmark_wealth,
         cohort_names: o.cohort_names,
         cohort_wealth: o.cohort_wealth,
         traders,
@@ -468,9 +480,15 @@ fn sandbox_snapshot(s: &Sandbox) -> SandboxSnapshot {
 }
 
 /// Start a sandbox run on a real company's price history with a cohort mix.
+///
+/// `async` so the (up to 20 s) Yahoo fetch runs off the main thread instead of
+/// freezing the window; the blocking HTTP call is moved onto a blocking worker.
 #[tauri::command]
-fn init_sandbox(config: SandboxCfg, state: State<SandboxState>) -> Result<SandboxInit, String> {
-    let series = market_data::load(&config.symbol);
+async fn init_sandbox(config: SandboxCfg, state: State<'_, SandboxState>) -> Result<SandboxInit, String> {
+    let symbol = config.symbol.clone();
+    let series = tauri::async_runtime::spawn_blocking(move || market_data::load(&symbol))
+        .await
+        .map_err(|e| format!("market data task failed: {e}"))?;
     if series.prices.len() < 60 {
         return Err(format!("not enough price data for {}", config.symbol));
     }
@@ -480,7 +498,17 @@ fn init_sandbox(config: SandboxCfg, state: State<SandboxState>) -> Result<Sandbo
     let cohorts: Vec<Cohort> = config
         .cohorts
         .iter()
-        .map(|c| Cohort::new(&c.name, c.count, c.memory, c.herding, c.risk))
+        // Clamp to ranges the engine is stable in: memory > 1 would make the
+        // accuracy EMA negative, and an unbounded count can exhaust memory.
+        .map(|c| {
+            Cohort::new(
+                &c.name,
+                c.count.min(500),
+                c.memory.clamp(1e-4, 1.0),
+                c.herding.clamp(0.0, 1.0),
+                c.risk.clamp(0.0, 10.0),
+            )
+        })
         .collect();
     let sandbox = Sandbox::new(series.prices.clone(), cohorts, sandbox_params(&config));
     let snapshot = sandbox_snapshot(&sandbox);
@@ -488,6 +516,8 @@ fn init_sandbox(config: SandboxCfg, state: State<SandboxState>) -> Result<Sandbo
         symbol: series.symbol,
         name: series.name,
         source: series.source,
+        requested: series.requested,
+        fallback: series.fallback,
         days: series.days,
         prices: series.prices,
         timestamps: series.timestamps,

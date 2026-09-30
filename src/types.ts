@@ -18,6 +18,7 @@ export type Snapshot = {
   sentiment: number;
   herding: number;
   avg_wealth: number;
+  benchmark_wealth: number; // passive buy & hold over the same days
   cohort_names: string[];
   cohort_wealth: number[];
   traders: Trader[];
@@ -28,7 +29,16 @@ export type Snapshot = {
   signal_usage: number[];
 };
 
-export type Init = { symbol: string; name: string; source: string; days: number; prices: number[]; snapshot: Snapshot };
+export type Init = {
+  symbol: string;
+  name: string;
+  source: string; // "yahoo" | "bundled"
+  requested: string; // ticker the user picked
+  fallback: boolean; // true when `symbol` was substituted for `requested`
+  days: number;
+  prices: number[];
+  snapshot: Snapshot;
+};
 
 export const SIGNAL_LABELS = [
   "Price > MA5",

@@ -19,6 +19,12 @@ pub struct MarketSeries {
     pub name: String,
     /// "yahoo" | "bundled"
     pub source: String,
+    /// The ticker the user asked for. Differs from `symbol` when the live fetch
+    /// failed and the bundled AAPL snapshot was substituted.
+    pub requested: String,
+    /// True when `symbol != requested` — the UI must say so rather than
+    /// silently showing another company's prices.
+    pub fallback: bool,
     pub days: usize,
     pub last_price: f64,
     /// Unix-second timestamps aligned with `prices`.
@@ -85,21 +91,41 @@ fn parse_bundled() -> Option<(String, String, Vec<i64>, Vec<f64>)> {
     Some((symbol, name, t, c))
 }
 
-/// Load a daily series for `symbol`, live from Yahoo with a bundled fallback.
-pub fn load(symbol: &str) -> MarketSeries {
+/// Normalise a user-supplied ticker, rejecting anything that isn't a plain
+/// Yahoo symbol (letters, digits, `.`, `-`, `^`, `=`), so it can't smuggle path
+/// segments or query parameters into the request URL.
+pub fn sanitize_symbol(symbol: &str) -> Option<String> {
     let sym = symbol.trim().to_uppercase();
-    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5y&interval=1d");
-    if let Some((ysym, t, c)) = http_get(&url).and_then(|b| parse_yahoo(&b)) {
-        let name = if ysym.is_empty() { sym.clone() } else { ysym };
-        return compute(&sym, &name, "yahoo", t, c);
-    }
-    if let Some((bsym, bname, t, c)) = parse_bundled() {
-        return compute(&bsym, &bname, "bundled", t, c);
-    }
-    compute(&sym, &sym, "bundled", Vec::new(), Vec::new())
+    let ok = !sym.is_empty()
+        && sym.len() <= 15
+        && sym.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '^' | '='));
+    ok.then_some(sym)
 }
 
-fn compute(symbol: &str, name: &str, source: &str, timestamps: Vec<i64>, prices: Vec<f64>) -> MarketSeries {
+/// Load a daily series for `symbol`, live from Yahoo with a bundled fallback.
+pub fn load(symbol: &str) -> MarketSeries {
+    let requested = symbol.trim().to_uppercase();
+    if let Some(sym) = sanitize_symbol(symbol) {
+        let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5y&interval=1d");
+        if let Some((ysym, t, c)) = http_get(&url).and_then(|b| parse_yahoo(&b)) {
+            let name = if ysym.is_empty() { sym.clone() } else { ysym };
+            return compute(&sym, &name, "yahoo", &requested, t, c);
+        }
+    }
+    if let Some((bsym, bname, t, c)) = parse_bundled() {
+        return compute(&bsym, &bname, "bundled", &requested, t, c);
+    }
+    compute(&requested, &requested, "bundled", &requested, Vec::new(), Vec::new())
+}
+
+fn compute(
+    symbol: &str,
+    name: &str,
+    source: &str,
+    requested: &str,
+    timestamps: Vec<i64>,
+    prices: Vec<f64>,
+) -> MarketSeries {
     let mut returns = Vec::new();
     for w in prices.windows(2) {
         returns.push((w[1] / w[0]).ln());
@@ -132,6 +158,8 @@ fn compute(symbol: &str, name: &str, source: &str, timestamps: Vec<i64>, prices:
         symbol: symbol.to_string(),
         name: name.to_string(),
         source: source.to_string(),
+        requested: requested.to_string(),
+        fallback: !symbol.eq_ignore_ascii_case(requested),
         days: prices.len(),
         last_price: prices.last().copied().unwrap_or(0.0),
         timestamps,
@@ -179,10 +207,31 @@ mod tests {
         assert_eq!(sym, "AAPL");
         assert!(c.len() > 500, "expected a long history, got {}", c.len());
         assert_eq!(t.len(), c.len());
-        let m = compute("AAPL", "Apple Inc.", "bundled", t, c);
+        let m = compute("AAPL", "Apple Inc.", "bundled", "AAPL", t, c);
+        assert!(!m.fallback);
         assert!(m.ret_std > 0.001 && m.ret_std < 0.2, "daily vol {}", m.ret_std);
         assert!(m.kurtosis.is_finite());
         assert_eq!(m.prices.len(), m.days);
         assert!(m.last_price > 0.0);
+    }
+
+    #[test]
+    fn fallback_is_flagged_when_another_symbol_is_substituted() {
+        let (_, _, t, c) = parse_bundled().unwrap();
+        let m = compute("AAPL", "Apple Inc.", "bundled", "MSFT", t, c);
+        assert!(m.fallback);
+        assert_eq!(m.requested, "MSFT");
+    }
+
+    #[test]
+    fn symbols_are_sanitized() {
+        assert_eq!(sanitize_symbol(" aapl ").as_deref(), Some("AAPL"));
+        assert_eq!(sanitize_symbol("BRK-B").as_deref(), Some("BRK-B"));
+        assert_eq!(sanitize_symbol("^GSPC").as_deref(), Some("^GSPC"));
+        assert_eq!(sanitize_symbol("BTC-USD").as_deref(), Some("BTC-USD"));
+        assert!(sanitize_symbol("").is_none());
+        assert!(sanitize_symbol("../v7/finance").is_none());
+        assert!(sanitize_symbol("AAPL?range=max").is_none());
+        assert!(sanitize_symbol("A&B").is_none());
     }
 }
