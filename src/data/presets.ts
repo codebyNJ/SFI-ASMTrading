@@ -14,7 +14,8 @@ export type CohortPreset = {
 };
 
 export const COHORT_PRESETS: CohortPreset[] = [
-  { key: "value", name: "Value", blurb: "patient, ignores the crowd", memory: 0.015, herding: 0.05, risk: 0.6, color: "#3b82f6", house: "blue" },
+  // "Patient", not "Value": there is no fundamental value in Path-3, only a long memory.
+  { key: "patient", name: "Patient", blurb: "long memory, ignores the crowd", memory: 0.015, herding: 0.05, risk: 0.6, color: "#3b82f6", house: "blue" },
   { key: "calm", name: "Calm", blurb: "steady, mild follower", memory: 0.03, herding: 0.15, risk: 0.9, color: "#22c55e", house: "green" },
   { key: "bubbly", name: "Bubbly", blurb: "excitable, chases trends", memory: 0.08, herding: 0.55, risk: 1.5, color: "#f59e0b", house: "orange" },
   { key: "herder", name: "Herders", blurb: "copies neighbours hard", memory: 0.06, herding: 0.9, risk: 1.2, color: "#a855f7", house: "purple" },
@@ -34,6 +35,17 @@ export const COMPANIES: Company[] = [
   { symbol: "SPY", name: "S&P 500 ETF" },
   { symbol: "KO", name: "Coca-Cola" },
   { symbol: "JPM", name: "JPMorgan" },
+];
+
+export const REPLAY_MODES = [
+  { key: "bootstrap", label: "Fresh synthetic path (bootstrap)" },
+  { key: "loop", label: "Replay the same history" },
+  { key: "stop", label: "Stop at the end" },
+];
+
+export const SIZING_MODES = [
+  { key: "volatility", label: "Scale by market volatility" },
+  { key: "meanvariance", label: "Mean-variance (rule confidence)" },
 ];
 
 export const TOPOLOGIES = [

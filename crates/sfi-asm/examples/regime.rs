@@ -71,10 +71,7 @@ fn main() {
         for &cost in &costs {
             for &theta in &thetas {
                 let (k, a, d, t) = run(tau, cost, theta);
-                println!(
-                    "{:>5} {:>9.3} {:>7.3}   {:>9.3} {:>9.3} {:>9.4} {:>9.3}",
-                    tau, cost, theta, k, a, d, t
-                );
+                println!("{:>5} {:>9.3} {:>7.3}   {:>9.3} {:>9.3} {:>9.4} {:>9.3}", tau, cost, theta, k, a, d, t);
                 if k > best.0 {
                     best = (k, format!("tau={tau}, spec_cost={cost}, theta={theta:.3}"));
                 }

@@ -36,11 +36,7 @@ impl ReturnStats {
         }
         let variance = m2 / nf;
         let std = variance.sqrt();
-        let excess_kurtosis = if variance > 1e-300 {
-            (m4 / nf) / (variance * variance) - 3.0
-        } else {
-            0.0
-        };
+        let excess_kurtosis = if variance > 1e-300 { (m4 / nf) / (variance * variance) - 3.0 } else { 0.0 };
 
         Self {
             n,

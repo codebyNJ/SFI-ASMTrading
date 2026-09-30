@@ -35,26 +35,29 @@ engine instead.
 
 ### Prerequisites
 - **Rust** (stable) + Cargo
-- **Node 18+** and a package manager
+- **Node 18+** and **pnpm**
 - Tauri OS prerequisites — <https://tauri.app/start/prerequisites/>
   (Windows: WebView2 + MSVC build tools)
 
-> ⚠️ `src-tauri/tauri.conf.json` currently runs the frontend via **bun**
-> (`bun run dev` / `bun run build`). Install [bun](https://bun.sh) **or** switch those
-> two commands to your package manager. Please **pick one package manager** and use
-> it consistently (don't commit two lockfiles — see *Known cleanups* below).
+The repo uses **pnpm** only: `pnpm-lock.yaml` is the single lockfile and
+`tauri.conf.json` runs `pnpm dev` / `pnpm build`. Please don't add another lockfile.
 
 ### Run / build / test
 ```bash
-pnpm install            # or bun install
+pnpm install
 pnpm tauri dev          # desktop app, hot reload
 
-# checks (run these before every PR)
+# checks (CI runs all of these on every PR)
+cargo fmt --check --manifest-path crates/sfi-asm/Cargo.toml
+cargo clippy --all-targets --manifest-path crates/sfi-asm/Cargo.toml -- -D warnings
 cargo test  --manifest-path crates/sfi-asm/Cargo.toml     # engine unit tests
-cargo check --manifest-path src-tauri/Cargo.toml          # backend type/compile + capabilities
-npx tsc --noEmit                                          # frontend type check
-pnpm build                                                # frontend production build
+cargo fmt --check --manifest-path src-tauri/Cargo.toml
+cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+cargo test  --manifest-path src-tauri/Cargo.toml          # backend tests
+pnpm test                                                 # frontend unit tests (Vitest)
+pnpm build                                                # tsc + production build
 ```
+`rustfmt.toml` at the repo root sets the style (120 columns).
 Run the engine headless (fast iteration, no GUI):
 ```bash
 cargo run --release --manifest-path crates/sfi-asm/Cargo.toml --example experiment
@@ -65,10 +68,13 @@ cargo run --release --manifest-path crates/sfi-asm/Cargo.toml --example experime
 
 ## Definition of done (PR checklist)
 
-- [ ] `cargo test` (engine) passes, and new engine behaviour has a unit test.
-- [ ] `cargo check` (src-tauri) passes.
-- [ ] `npx tsc --noEmit` passes (strict mode; **no unused vars/params**).
-- [ ] `pnpm build` succeeds.
+- [ ] CI is green: fmt, clippy (`-D warnings`) and tests for both crates, `pnpm test`,
+      and `pnpm build` (strict TypeScript; **no unused vars/params**).
+- [ ] New engine behaviour has a unit test.
+- [ ] A new sprite is added to the asset manifest in `SunnysideWorld.tsx` *and* its
+      file is committed under `public/` (only used sprites are kept).
+- [ ] New page resources work under the CSP in `tauri.conf.json` (no inline
+      scripts, `eval`, or remote hosts).
 - [ ] App launches (`pnpm tauri dev`) with no new console errors; include a
       screenshot/GIF for visual changes.
 - [ ] Determinism preserved (same seed → same run) — see below.
@@ -130,6 +136,9 @@ cargo run --release --manifest-path crates/sfi-asm/Cargo.toml --example experime
   needs new numbers, add them to the engine/`SandboxSnapshot` first, then `types.ts`.
 - **Engine parameter:** add to `SandboxParams`, thread it through
   `src-tauri` (`SandboxCfg` + `sandbox_params`) and the Controls panel if user‑facing.
+- **A performance claim:** check it holds across seeds before putting it in the UI or
+  docs, with the in‑app *Test 16 seeds* button or the `sandbox_sweep` example. Compare
+  against the buy‑and‑hold benchmark, not the starting wealth.
 
 ---
 
@@ -144,11 +153,10 @@ Bundled art is **Sunnyside World by Daniel Diggle**
 repackage/resell the raw assets or use them for AI training. Don't add third‑party
 assets without a compatible license and credit in the README.
 
-## Known cleanups (good first contributions)
-- Consolidate to **one package manager / lockfile** (both `bun.lock` and a pnpm
-  lockfile exist).
-- Remove the unused legacy "Simple Summer" pack (`public/PNG`, `public/EPS`).
-- Add a code **LICENSE** (the README has a placeholder).
+## Where to help next
+See **[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md)** for the maturity review and the
+open roadmap items (e.g. splitting `SunnysideWorld.tsx`, generated DTO types, an
+endogenous‑price mode).
 
 ---
 

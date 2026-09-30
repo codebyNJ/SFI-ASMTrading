@@ -35,13 +35,7 @@ impl Agent {
     /// state (and the result is order-independent and reproducible). Offspring
     /// replace this agent's weakest rules. With empty `neighbor_pools` this is the
     /// classic individual GA.
-    pub fn run_ga_social(
-        &mut self,
-        rng: &mut Rng,
-        p: &Params,
-        own_pool: &[Rule],
-        neighbor_pools: &[&[Rule]],
-    ) {
+    pub fn run_ga_social(&mut self, rng: &mut Rng, p: &Params, own_pool: &[Rule], neighbor_pools: &[&[Rule]]) {
         let m = self.rules.len();
         if m < 2 {
             return;

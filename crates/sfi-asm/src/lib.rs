@@ -31,24 +31,26 @@ pub const NBITS: usize = 12;
 /// is the central observable for the regime and (later) network experiments.
 pub const TECHNICAL_BITS: std::ops::Range<usize> = 6..10;
 
-pub mod rng;
-pub mod params;
-pub mod dividend;
-pub mod classifier;
 pub mod agent;
+pub mod classifier;
+pub mod dividend;
+pub mod ga;
 pub mod market;
 pub mod network;
-pub mod ga;
-pub mod stats;
-pub mod sim;
+pub mod params;
+pub mod rng;
 pub mod sandbox;
+pub mod sim;
+pub mod stats;
 
 pub use agent::Agent;
 pub use classifier::Rule;
 pub use dividend::{Dividend, Ree};
 pub use network::{Network, Topology};
 pub use params::Params;
-pub use sandbox::{Cohort, Outcomes, Sandbox, SandboxParams};
 pub use rng::Rng;
+pub use sandbox::{
+    sweep, Cohort, CohortStats, CohortSweep, Outcomes, Replay, Sandbox, SandboxParams, Sizing, SweepSummary,
+};
 pub use sim::Simulation;
 pub use stats::ReturnStats;
