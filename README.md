@@ -19,18 +19,27 @@ and **[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md)** for a maturity review and r
 ## What it does
 
 - **Real data, real ticker.** Loads a company's daily price history from Yahoo
-  Finance (AAPL, MSFT, NVDA, TSLA, …), with an offline fallback. The price is
-  *exogenous* — the town reacts to it, it doesn't invent it.
+  Finance (AAPL, MSFT, NVDA, TSLA, …). Every fetch is cached, so a ticker you
+  have loaded before also works offline; otherwise a bundled AAPL sample is used
+  and the title bar says so. The price is *exogenous* — the town reacts to it,
+  it doesn't invent it.
 - **Self‑taught traders.** Each trader carries a population of evolving
   rules‑of‑thumb (a classifier system), forecasts the next move, takes a long/short
   position, **wins or loses money**, and **learns** (a genetic algorithm weeds out
   bad rules and copies fit neighbours over a social network).
-- **Composable guilds.** Mix behavioural cohorts in one run — Value, Calm, Bubbly,
+- **Composable guilds.** Mix behavioural cohorts in one run — Patient, Calm, Bubbly,
   Herders, Reckless — each with its own temperament, herding tendency, and risk.
 - **See the "why".** Click a townsperson to inspect its active rule, forecast,
   conviction, and the market signals it watches. A live **Insights** column shows
-  the town's strategy mix (trend vs contrarian), belief spread, signal usage, and a
-  per‑guild wealth leaderboard over the whole run.
+  the price with the town's net long/short position, the strategy mix (trend vs
+  contrarian), belief spread, signal usage, and a per‑guild leaderboard with
+  wealth vs **buy & hold**, Sharpe ratio and max drawdown.
+- **Is it luck?** One click re‑runs the town on 16 seeds and reports each
+  guild's result against buy & hold with a 95% confidence interval.
+- **Honest replays.** When the real history ends, the town continues on a fresh
+  *synthetic* path (a block bootstrap of the real returns, clearly labelled),
+  replays the same history (labelled *in‑sample*), or stops — your choice.
+- **Fast‑forward & export.** Up to 60 days/sec, and a CSV export of the run.
 - **A pixel world + macOS‑style UI.** A draggable tile town (Sunnyside World art),
   with translucent floating panels, a custom titlebar, and SF fonts.
 
@@ -46,32 +55,43 @@ Each trading **day**:
 
 1. The real price moves; the town reads it off the notice board.
 2. Every trader picks its best‑matching rule and **forecasts** tomorrow's return.
-3. It takes a **position** (buy / short), sized by conviction ÷ recent volatility.
-4. Money is settled on the actual move — right calls grow wealth, wrong calls shrink it.
+3. It takes a **position** (buy / short), sized by its forecast ÷ recent volatility
+   (or, optionally, by mean‑variance sizing on the rule's own track record).
+4. Money is settled on the actual move, net of an optional trading cost — right
+   calls grow wealth, wrong calls shrink it. A trader that loses 99% goes bankrupt
+   and stops trading.
 5. Every rule that fired **learns** from its error; periodically a **genetic
    algorithm** breeds the fittest rules and **copies** successful neighbours (herding).
 
+Trading starts after a 50‑day warm‑up so every moving average has full history.
 Same seed → same run (it's deterministic, not random noise). The interesting
-behaviour — bubbles, volatility clustering, who profits — *emerges*.
+behaviour — herding, strategy swings, who profits — *emerges*.
+
+> **What the model finds so far:** on the bundled 5‑year AAPL history, every
+> default guild ends well behind simply holding the stock, and that result holds
+> across seeds (`cargo run --release --example sandbox_sweep`). The town is a
+> lens on crowd behaviour, not a strategy that beats the market.
 
 ---
 
 ## Project structure
 
 ```
-remind/
+SFI-ASMTrading/
 ├─ crates/sfi-asm/        # Pure Rust simulation engine (no GUI) — unit‑tested
-│  └─ src/                #   dividend/REE, classifier agents, GA, network, sandbox (Path‑3)
+│  ├─ src/                #   dividend/REE, classifier agents, GA, network, sandbox (Path‑3)
+│  └─ examples/           #   headless runs, incl. sandbox_sweep (multi‑seed robustness)
 ├─ src-tauri/             # Tauri shell: commands, stock-data fetch, app config
-│  ├─ src/lib.rs          #   init_sandbox / step_sandbox / fetch_real_market / calibrate
-│  └─ src/market_data.rs  #   Yahoo Finance loader + bundled fallback
+│  ├─ src/lib.rs          #   init_sandbox / step_sandbox / sweep_seeds / export_run
+│  └─ src/market_data.rs  #   Yahoo Finance loader + disk cache + bundled fallback
 ├─ src/                   # Frontend (Vite + React + TS + Tailwind/shadcn + PixiJS)
 │  ├─ App.tsx             #   two‑column layout, controls, stepping loop
 │  ├─ SunnysideWorld.tsx  #   the pixel town (PixiJS)
-│  └─ components/         #   TitleBar, FloatingPanel, Insights, TraderInspector, ui/*
-├─ public/                # Pixel‑art assets (Sunnyside World) + extracted tiles
-├─ CONCEPT.md             # the story / metaphor
-└─ PRD_PHASE_2.md         # current phase spec
+│  ├─ components/         #   TitleBar, FloatingPanel, Insights, TraderInspector, ui/*
+│  └─ lib/                #   pacing + formatting helpers (Vitest‑tested)
+├─ public/                # Only the Sunnyside sprites the town uses + extracted tiles
+├─ docs/IMPROVEMENTS.md   # maturity review & roadmap
+└─ CONCEPT.md             # the story / metaphor
 ```
 
 ---
@@ -84,15 +104,13 @@ remind/
 - Tauri OS prerequisites (on Windows: WebView2, MSVC build tools) — see
   <https://tauri.app/start/prerequisites/>
 
-> ⚠️ This repo's `src-tauri/tauri.conf.json` runs the frontend via **bun**
-> (`bun run dev` / `bun run build`). Either install [bun](https://bun.sh), **or**
-> change `beforeDevCommand` / `beforeBuildCommand` there to your manager
-> (`pnpm dev` / `pnpm build`).
+The project uses **pnpm** (`pnpm-lock.yaml` is the only lockfile, and
+`tauri.conf.json` runs `pnpm dev` / `pnpm build`).
 
 ### Run (desktop app)
 ```bash
-pnpm install          # or: bun install
-pnpm tauri dev        # or: bun tauri dev
+pnpm install
+pnpm tauri dev
 ```
 
 ### Build a release
@@ -103,9 +121,13 @@ pnpm tauri build
 ### Run the engine on its own (fast, no GUI)
 ```bash
 cargo test  --manifest-path crates/sfi-asm/Cargo.toml          # unit tests
-cargo run   --release --manifest-path crates/sfi-asm/Cargo.toml --example experiment
+cargo run   --release --manifest-path crates/sfi-asm/Cargo.toml --example sandbox_sweep
 ```
-Other examples: `run` (regime demo), `regime` (knob sweep), `experiment` (network comparison).
+`sandbox_sweep` runs the default town on the bundled AAPL history across 32 seeds
+and prints each guild's excess return over buy & hold with a 95% CI (pass a JSON
+file, seed count and cost in bps as arguments to change them). Examples for the
+classic endogenous‑price SFI model: `run` (regime demo), `regime` (knob sweep),
+`experiment` (network comparison).
 
 ---
 
@@ -129,8 +151,11 @@ Other examples: `run` (regime demo), `regime` (knob sweep), `experiment` (networ
   Please keep attribution; per its license, do not repackage/resell the raw assets
   or use them for AI training. (Asset files live under `public/`.)
 
-The legacy "Simple Summer" top‑down pack (`public/PNG`, `public/EPS`) is **unused**
-(kept only for reference) — the world is built from Sunnyside.
+Only the ~30 Sunnyside sprites the town actually draws are included (listed in
+the asset manifest at the top of `src/SunnysideWorld.tsx`); the full pack and the
+unused "Simple Summer" pack were removed, so the app ships only what it uses and
+the bundle stays ~1 MB. To use a new sprite, add that file from your
+own copy of the pack under the same path.
 
 ---
 
@@ -142,5 +167,5 @@ The legacy "Simple Summer" top‑down pack (`public/PNG`, `public/EPS`) is **unu
 
 ## License
 
-- **Code:** add your preferred license here (e.g. MIT) — currently unspecified.
+- **Code:** MIT — see [LICENSE](LICENSE).
 - **Bundled assets:** retain their own licenses (see *Assets & credits*).

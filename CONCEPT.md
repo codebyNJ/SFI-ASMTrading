@@ -14,7 +14,7 @@ differently:
 
 | Guild | House | Personality |
 |---|---|---|
-| **Value** | blue | Patient. Ignores gossip, trades on its own slow read. |
+| **Patient** | blue | Long memory. Ignores gossip, trades on its own slow read. |
 | **Calm** | green | Steady. Mild follower of the mood. |
 | **Bubbly** | orange | Excitable. Chases whatever is trending. |
 | **Herders** | purple | Copies whoever is nearby, hard. |

@@ -16,9 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/sfi-asm
+      - name: Format
+        run: cargo fmt --check --manifest-path crates/sfi-asm/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --release --all-targets --manifest-path crates/sfi-asm/Cargo.toml -- -D warnings
       - name: Unit tests (incl. determinism)
         run: cargo test --release --manifest-path crates/sfi-asm/Cargo.toml
       - name: Examples build
@@ -34,16 +40,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
       # tauri::generate_context! needs the frontend dist dir to exist.
       - run: mkdir -p dist
+      - name: Format
+        run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
       - name: Tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
   frontend:
-    name: Frontend (tsc + vite build)
+    name: Frontend (tests + tsc + vite build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,4 +67,5 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm test
       - run: pnpm build

@@ -1,30 +1,47 @@
 # Trading Town — maturity review & improvement roadmap
 
-A review of where the project stands and what would move it forward, with the
-reasoning for each item. Items marked **✅ done in this PR** ship with the review;
-the others are ranked by value versus effort.
+A review of where the project stood, what was changed, and what is still open,
+with the reasoning for each item.
 
 ---
 
-## 1. How mature is it right now?
+## 1. Maturity: before and after
 
-**Overall: a well-built research prototype (roughly "alpha").** The core idea is
-clear and the architecture is sound. The gaps are in scientific validity,
-reproducibility tooling, and release hygiene, not in the code's structure.
+**Before: a well-built research prototype (alpha).** The architecture was sound;
+the gaps were in scientific validity, reproducibility tooling and release hygiene.
+**After: a credible research beta.** Results are now benchmarked, risk-adjusted,
+out-of-sample by default and checked across seeds, and the release is lean and
+guarded by CI. The main open work is structural (splitting the renderer,
+generated types) and new research modes.
 
-| Area | Rating | Notes |
-|---|---|---|
-| Architecture | 🟢 Strong | Pure, dependency-free Rust engine, a thin Tauri layer, and a UI that only renders snapshots. The boundaries are clear and documented in CONTRIBUTING. |
-| Engine correctness | 🟡 Good, with bugs | Deterministic seeded RNG, drift-neutral mutation, bounded fitness, and a variance floor, so the classic SFI pitfalls are handled. The Path-3 sandbox had a loop-seam P&L bug (fixed here). |
-| Tests | 🟡 Decent for the engine | 22 unit tests before this PR, covering invariants, determinism and REE recovery. There were no frontend tests and no CI (CI added here). |
-| Scientific validity | 🟠 Weakest area | There was no baseline to compare against (added here) and no trading costs (added here). Traders relearn the same looping path, so results are in-sample, and each result comes from one seed. |
-| UX | 🟢 Charming | The pixel town, the inspector and the insights panel work well. Errors were only logged to the console, and offline fallback silently switched the company (both fixed here). |
-| Release hygiene | 🔴 Needs work | Stale `bun.lock`, two lockfiles, ~70 MB of unused art shipped in the bundle, leftover `remind` identifiers, `csp: null`, dead commands, and a README link to a missing file. |
-| Docs | 🟢 Above average | README, CONCEPT and CONTRIBUTING are thoughtful, and the "honesty rules" are unusually good for a hobby project. |
+| Area | Before | After | What changed |
+|---|---|---|---|
+| Architecture | 🟢 Strong | 🟢 Strong | Dead classic-SFI commands removed from the app; engine stays pure. |
+| Engine correctness | 🟡 Bugs | 🟢 Good | Loop-seam P&L, NaN panic, and "herding 1.00 when flat" fixed; warm-up period. |
+| Tests | 🟡 Engine only, no CI | 🟢 Good | 34 engine, 7 backend, 7 frontend tests; CI with fmt + clippy gates. |
+| Scientific validity | 🟠 Weakest | 🟢 Good | Benchmark, costs, bootstrap replays, Sharpe/drawdown, 95% CIs across seeds. |
+| UX | 🟢 Charming | 🟢 Richer | Market chart, risk table, robustness card, fast-forward, CSV export, honest badges. |
+| Release hygiene | 🔴 Needs work | 🟢 Good | One lockfile, 115 MB → 1.2 MB bundle, strict CSP, renamed from `remind`. |
+| Docs | 🟢 Good | 🟢 Good | README/CONTRIBUTING updated; this roadmap. |
+
+### The headline finding
+With the new tools the model can answer "does any guild beat the market?". On the
+bundled 5-year AAPL history (1,205 trading days after warm-up), **every default
+guild ends about 55–60% behind buy & hold with zero trading costs, on every one
+of 32 seeds**, with 95% CIs of about ±1–4 points. At 10 bps the gap widens to
+about 57–70%. This is the result the
+project's honesty rules ask for: the town is a lens on crowd behaviour, not a
+strategy. Reproduce with:
+
+```bash
+cargo run --release --manifest-path crates/sfi-asm/Cargo.toml --example sandbox_sweep            # 0 bps
+cargo run --release --manifest-path crates/sfi-asm/Cargo.toml --example sandbox_sweep -- \
+  src-tauri/resources/stock_aapl.json 32 10                                                       # 10 bps
+```
 
 ---
 
-## 2. Changes made in this PR
+## 2. Round 1: bug fixes and honesty basics
 
 ### ✅ Loop-seam bug: fake crash every time the data loops (engine)
 `Sandbox::step` wraps from the last day back to day 0 and settled P&L on
@@ -91,125 +108,113 @@ CONTRIBUTING, which was previously manual only.
 
 ---
 
-## 3. Recommended next steps (not in this PR)
 
-### P0: scientific validity (these matter most for a research tool)
+## 3. Round 2: the roadmap, implemented
 
-1. **Stop replaying the same path (in-sample learning).**
-   After one loop, the rules have been selected on this exact price path, so
-   loop 2 onward measures memorisation, not skill. Options, from cheapest up:
-   (a) run a single pass and stop, clearly labelled; (b) hold out the last
-   N % as an out-of-sample window and report the two periods separately;
-   (c) after the first pass, feed a **stationary block bootstrap** of the
-   returns so each loop is a fresh but statistically similar path.
-   *Why:* without this, a guild "winning" can be pure overfitting.
+### P0: scientific validity
 
-2. **Multi-seed runs and confidence intervals.**
-   Every number on screen is one seed. Add a headless `Sandbox` batch runner
-   (an engine example plus a Tauri command) that runs K seeds and reports
-   mean ± CI of per-guild excess return over buy-and-hold. Only differences
-   that survive across seeds should be shown as findings.
-   *Why:* this follows the project's own honesty rule ("if a finding is
-   tentative, say so").
+1. ✅ **No more in-sample replays by default.** New `Replay` mode in the engine:
+   - `Bootstrap { block }` continues on a stationary block bootstrap (Politis &
+     Romano) of the real returns. The new path starts from the tail of the old
+     one, so there is no seam and signals stay continuous. It keeps the real
+     volatility and short-range structure without repeating the path.
+   - `Loop` (the old behaviour) is kept, and the UI labels it "replay N · in-sample".
+   - `Stop` ends the run after one pass.
 
-3. **Risk-adjusted metrics.**
-   Report, per guild: excess return over the benchmark, annualised Sharpe,
-   max drawdown and turnover. Use the **median** or geometric mean alongside
-   the arithmetic mean, because a few lucky "Reckless" traders dominate an
-   average of compounding wealth.
-
-4. **Warm-up period.**
-   On days 0–49 the MA20 and MA50 signals are computed from partial windows,
-   yet traders trade on them from day 0. Start settlement at `idx = 50` (or
-   the longest lookback) and let rules only observe before that.
-
-5. **Position sizing should use the rule's own confidence.**
-   The position is currently `risk · r̂ / σ_price`, and the active rule's
-   forecast-error variance (`active_acc`) is ignored. The SFI-faithful choice
-   is mean-variance sizing, `r̂ / (λ · var_rule)`. This makes accurate rules
-   bet more, which is the mechanism behind the original paper's results.
-
-6. **Bankruptcy handling.**
-   Wealth is floored at `1e-6`, so ruined traders stay in the population
-   forever, still teaching neighbours via the GA and dragging down averages.
-   Either retire and respawn them (tracking the count as a metric), or exclude
-   them from social learning.
+   The app now defaults to **Bootstrap**, and the title bar shows "synthetic pass N"
+   while the chart draws synthetic prices in purple. A separate RNG stream is used
+   for paths, so the first pass is bit-identical whatever the mode (tested).
+2. ✅ **Multi-seed robustness.** `sfi_asm::sweep` runs K seeds in parallel threads
+   (deterministic, tested) and reports per guild the mean excess log return over
+   buy & hold with a Student-t 95% CI, the share of seeds that beat it, and mean
+   Sharpe and drawdown. It is available as the `sweep_seeds` command ("Test 16
+   seeds" button → "Is it luck?" card, which only says "beats"/"lags" when the CI
+   clears zero) and as the `sandbox_sweep` example.
+3. ✅ **Risk-adjusted metrics.** Per guild: mean and median wealth, excess vs buy
+   & hold, annualised Sharpe of pooled daily returns, max drawdown, turnover and
+   bankruptcies. Buy & hold gets its own Sharpe and drawdown for comparison.
+   Per trader: max drawdown (in the inspector).
+4. ✅ **Warm-up.** Trading starts at index 50 (`SandboxParams.warmup`), so MA50
+   is always computed on a full window; Loop replays restart there too.
+5. ✅ **Mean-variance sizing** (opt-in): `Sizing::MeanVariance { gamma }` sizes by
+   `r̂ / (γ · rule variance)`, so rules with a better track record bet more.
+   The default stays volatility sizing so existing results are comparable.
+6. ✅ **Bankruptcy.** Below `bust_fraction` (1%) of starting wealth a trader stops
+   trading and is excluded from neighbours' social learning; counts are shown
+   per guild.
 
 ### P1: product and UX
 
-7. **Fast-forward / batch stepping.** At the maximum of 6 days/s, a 5-year
-   series takes about 3.5 minutes per loop. `step_sandbox` already takes
-   `batch`, so add a "⏩ ×20" mode that steps several days per frame.
-8. **Export a run.** A CSV/JSON of daily price, sentiment, herding, guild
-   wealth and benchmark lets users analyse results outside the app, and makes
-   results citable.
-9. **Expose `cost_bps`** as an Advanced slider (the backend is ready), with
-   0, 5 and 20 bps presets.
-10. **Cache fetched series on disk** (the app data dir) with a timestamp, so
-    the second run of a ticker is instant and offline-capable for *that*
-    ticker rather than falling back to AAPL.
-11. **Price chart with trade markers** under the town. The notice board shows
-    today's price, but there is no view of where the town was long or short
-    against the path.
-12. **Rename the "Value" guild** (e.g. "Patient"). The project's own honesty
-    rules say there is no fundamental value in Path-3. The name suggests
-    value investing, but the guild's parameters are just a long memory and
-    low herding.
+7. ✅ **Fast-forward** to 60 days/sec; above 6 days/sec the UI steps in batches
+   (`src/lib/pacing.ts`, tested) so the town isn't redrawn every day.
+8. ✅ **CSV export** of the run (day, pass, synthetic flag, price, sentiment,
+   herding, net position, average wealth, buy & hold, per-guild wealth), written to
+   Downloads.
+9. ✅ **Cost slider** (0–50 bps; the app default is 5 bps), plus replay-mode and
+   sizing selectors under Advanced.
+10. ✅ **Disk cache** for fetched tickers (app cache dir). Offline, a ticker you
+    loaded before is used ("cached data" badge) before falling back to AAPL.
+11. ✅ **"Market & the crowd" chart:** the price with the town's net long/short
+    position as bars.
+12. ✅ **"Value" guild renamed to "Patient"** (there is no fundamental value in Path-3).
 
 ### P2: engineering hygiene
 
-13. **One package manager.** `bun.lock` is **stale**: it is missing pixi.js,
-    radix, tailwind and others, while `tauri.conf.json` runs `bun run dev`.
-    `pnpm-lock.yaml` is in sync (CI uses it). Either regenerate `bun.lock`
-    and delete the pnpm lockfile, or switch `tauri.conf.json` to pnpm and
-    delete `bun.lock`.
-14. **Ship only the art you use.** `vite build` copies all of `public/` into
-    the app bundle, which comes to about **115 MB**. That includes the unused
-    "Simple Summer" pack (`public/EPS` at 67 MB and `public/PNG` at 2 MB) and
-    the whole Sunnyside pack with its GameMaker project. Only a handful of
-    sprites are used. Besides the install size, shipping the *raw* pack inside
-    a distributed binary is at odds with the Sunnyside licence ("don't
-    repackage the raw assets"). Copy the used sprites into `public/world/`
-    and delete the rest.
-15. **Remove dead surface.** `init_sim`, `step_sim`, `calibrate` and
-    `fetch_real_market` are registered but unused by the UI, and
-    `resources/btc_daily.json` is not loaded anywhere. Either put the classic
-    SFI mode behind a UI toggle or move it to examples only.
-16. **Rename leftovers.** The package and product are still `remind`, with
-    identifier `com.remind.app`. The README also links to a missing
-    `PRD_PHASE_2.md`.
-17. **Set a CSP.** `"csp": null` disables Tauri's content-security policy.
-    The app loads only local assets, so a strict
-    `default-src 'self'; img-src 'self' data: blob:` is cheap
-    defence-in-depth.
-18. **`cargo fmt` + clippy gate.** The engine isn't `rustfmt`-clean today, and
-    clippy reports 2 warnings. Run `cargo fmt` once in a dedicated commit,
-    then add `cargo fmt --check` and `clippy -D warnings` to CI.
-19. **Frontend tests.** Add a Vitest smoke test for `Insights` and
-    `TraderInspector` with a fixture snapshot. The DTO ↔ `types.ts` mirror
-    is currently checked only by hand; consider generating the TS types with
-    `ts-rs` or `specta`.
-20. **Split `SunnysideWorld.tsx`** (1,200 lines) into tile map, sprites and
-    trader layer. It is the one file that is getting hard to change safely.
+13. ✅ **pnpm only.** The stale `bun.lock` is deleted and `tauri.conf.json` runs
+    `pnpm dev`/`pnpm build`. The unused `@sprite-foundry/townsfolk-48`
+    dependency was removed.
+14. ✅ **Only used art ships.** 31 Sunnyside sprites (the manifest in
+    `SunnysideWorld.tsx`) plus the extracted tiles are kept. The rest of the
+    pack, its GameMaker project, and the unused "Simple Summer" pack were removed.
+    `dist` went from 115 MB to 1.2 MB.
+15. ✅ **Dead surface removed:** `init_sim`, `step_sim`, `calibrate`,
+    `fetch_real_market` and `btc_daily.json`. The classic SFI engine stays in
+    the crate with its examples.
+16. ✅ **Renamed** `remind` → `trading-town` (package, crate, product
+    "Trading Town", identifier `com.tradingtown.desktop`). The broken
+    `PRD_PHASE_2.md` link was removed, and the README license section now
+    points at the MIT LICENSE.
+    *Note:* the new identifier means a fresh app-data folder on existing installs.
+17. ✅ **Strict CSP** in production (`default-src 'self'`, no remote hosts, no
+    eval). PixiJS v8 needs `import "pixi.js/unsafe-eval"` to render without
+    `eval`. The production build was verified in Chromium under this exact
+    policy with no violations. `devCsp` is left open for Vite HMR.
+18. ✅ **`cargo fmt` + `clippy -D warnings`** are clean in both crates and
+    enforced in CI (`rustfmt.toml`: 120 columns).
+19. 🟡 **Frontend tests: partly done.** Vitest is set up, with tests for pacing
+    and formatting helpers, and runs in CI. Component tests and generated DTO
+    types (`ts-rs`/`specta`) are still open.
+20. ⬜ **Split `SunnysideWorld.tsx`: not done.** A 1,200-line renderer refactor
+    needs visual regression checks in the real app; it should be its own PR.
 
-### P3: research extensions (after the P0 items)
+### P3: research extensions (open)
 
-- **An endogenous-price mode** that reuses the classic `Simulation` (already
-  in the crate), so users can compare "town reacts to a real market" with
-  "town *makes* the market" (bubbles that the traders cause themselves).
-- **Network experiments in the sandbox**: does a scale-free (hub) topology
-  measurably increase herding or drawdowns across seeds, compared with a
-  lattice? Item 2 makes this answerable.
-- **Richer signals**: volume, a volatility regime, and a cross-asset signal
-  (e.g. SPY for single stocks).
+- **An endogenous-price mode** that reuses the classic `Simulation`, to compare
+  "town reacts to a market" with "town makes the market".
+- **Network experiments across seeds:** does a scale-free topology raise
+  herding or drawdowns relative to a lattice? `sweep` makes this a short
+  experiment now.
+- **Richer signals:** volume, volatility regime, cross-asset (e.g. SPY).
 
 ---
 
-## 4. Verification for this PR
+## 4. Behaviour changes to be aware of
 
-- `cargo test --release` in `crates/sfi-asm`: 25 passed (3 new).
-- `cargo test` in `src-tauri`: 4 passed (2 new).
-- `pnpm exec tsc --noEmit` and `pnpm build`: clean.
-- Determinism: with `cost_bps = 0`, a non-wrapping run matches the previous
-  engine bit for bit (the evolve optimisation doesn't change results). Runs
-  that cross the loop seam change, as intended.
+- **Engine defaults:** 50-day warm-up (runs start at day 51); bankruptcy at 1%.
+  `replay`, `sizing` and `cost_bps` keep their old behaviour by default
+  (Loop / volatility / 0).
+- **App defaults:** bootstrap replay and a 5 bps trading cost.
+- **"Herding"** is 0 (not 1) when nobody holds a position.
+- **Identifier change:** `com.remind.app` → `com.tradingtown.desktop`.
+
+## 5. Verification
+
+- Engine: 34 tests (`cargo test --release`), fmt and clippy clean.
+- Backend: 7 tests, fmt and clippy clean.
+- Frontend: 7 Vitest tests, `tsc` and `vite build` clean.
+- UI: the production build was driven in headless Chromium under the production
+  CSP, with a mocked Tauri bridge serving snapshots the real Rust backend
+  produced. Build, run, fast-forward into a synthetic pass, the seed test,
+  export, and Advanced all worked, and there were no CSP violations or missing
+  sprites.
+- Not verified: the packaged desktop app itself (no display in this environment).
