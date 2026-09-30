@@ -1,302 +1,33 @@
-//! Tauri backend: owns one live `Simulation` and exposes commands to configure
-//! it and pull snapshots for the dashboard. The heavy compute stays in Rust; the
-//! frontend just drives stepping and renders snapshots.
+//! Tauri backend: owns the live Path-3 trading sandbox and exposes commands to
+//! build it, step it, stress-test it across seeds, and export a run. The heavy
+//! compute stays in Rust; the frontend drives stepping and renders snapshots.
 
 mod market_data;
 
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use sfi_asm::{Cohort, Params, Sandbox, SandboxParams, Simulation, Topology};
-use tauri::State;
+use sfi_asm::{sweep, Cohort, Outcomes, Replay, Sandbox, SandboxParams, Sizing, Topology};
+use tauri::{AppHandle, Manager, State};
 
-use market_data::MarketSeries;
+/// Cap on logged days kept for CSV export (~40 years of daily data).
+const LOG_CAP: usize = 10_000;
 
-/// Managed application state: the single live simulation (if initialized).
-#[derive(Default)]
-struct AppState {
-    sim: Mutex<Option<Simulation>>,
+/// Everything needed to re-run or export the current town.
+struct Live {
+    sandbox: Sandbox,
+    symbol: String,
+    /// The real history the run started from (sweeps always use this).
+    prices: Vec<f64>,
+    cohorts: Vec<Cohort>,
+    params: SandboxParams,
+    log: Vec<LogRow>,
 }
 
 /// Managed state for the Path-3 trading sandbox.
 #[derive(Default)]
-struct SandboxState(Mutex<Option<Sandbox>>);
-
-/// Configuration sent from the UI to (re)create a simulation.
-#[derive(Deserialize)]
-struct SimConfig {
-    n_agents: usize,
-    ga_interval: u64,
-    theta: f64,
-    spec_cost: f64,
-    social_prob: f64,
-    /// "none" | "lattice" | "random" | "scalefree"
-    topology: String,
-    /// Target mean degree (k for lattice, mean_degree for random, 2*m for scale-free).
-    degree: f64,
-    seed: u64,
-    /// Dividend-noise scale. When omitted, the default is used; calibration sets it.
-    #[serde(default)]
-    sigma_eps: Option<f64>,
-    /// Risk aversion. When omitted, the default is used; calibration may lower it.
-    #[serde(default)]
-    lambda: Option<f64>,
-}
-
-#[derive(Serialize)]
-struct NodeDto {
-    degree: usize,
-    /// Agent's mean forecast slope `a` (a crude "belief" indicator for coloring).
-    belief: f64,
-    /// Net demand at the cleared price; >1 = net buyer (bullish), <1 = net seller.
-    demand: f64,
-    /// Mean forecast-error variance across the agent's rules; lower = more skilled.
-    accuracy: f64,
-}
-
-/// Everything the dashboard needs to render one frame.
-#[derive(Serialize)]
-struct Snapshot {
-    period: u64,
-    price: f64,
-    ree: f64,
-    rel_dev: f64,
-    ret_std: f64,
-    kurtosis: f64,
-    ac1: f64,
-    abs_ac1: f64,
-    tech_bits: f64,
-    prices: Vec<f64>,
-    ree_series: Vec<f64>,
-    a_bins: Vec<u32>,
-    a_min: f64,
-    a_max: f64,
-    mean_degree: f64,
-    max_degree: usize,
-    nodes: Vec<NodeDto>,
-    edges: Vec<[usize; 2]>,
-}
-
-fn build_params(c: &SimConfig) -> Params {
-    let mut p = Params::classic();
-    p.n_agents = c.n_agents.clamp(2, 2000);
-    p.ga_interval = c.ga_interval.max(1);
-    p.theta = c.theta.clamp(1e-4, 1.0);
-    p.spec_cost = c.spec_cost.max(0.0);
-    p.social_prob = c.social_prob.clamp(0.0, 1.0);
-    p.seed = c.seed;
-    if let Some(s) = c.sigma_eps {
-        p.sigma_eps = s.clamp(1e-4, 100.0);
-    }
-    if let Some(l) = c.lambda {
-        p.lambda = l.clamp(0.02, 10.0);
-    }
-    p.topology = match c.topology.as_str() {
-        "lattice" => Topology::Lattice { k: (c.degree.round() as usize).max(2) },
-        "random" => Topology::Random { mean_degree: c.degree.max(0.0) },
-        "scalefree" => Topology::ScaleFree { m: ((c.degree / 2.0).round() as usize).max(1) },
-        _ => Topology::None,
-    };
-    p
-}
-
-fn histogram(values: &[f64], lo: f64, hi: f64, bins: usize) -> Vec<u32> {
-    let mut h = vec![0u32; bins];
-    if hi <= lo || bins == 0 {
-        return h;
-    }
-    for &v in values {
-        let idx = (((v - lo) / (hi - lo)) * bins as f64).floor() as isize;
-        let idx = idx.clamp(0, bins as isize - 1) as usize;
-        h[idx] += 1;
-    }
-    h
-}
-
-fn make_snapshot(sim: &Simulation) -> Snapshot {
-    let s = sim.stats();
-    let a_values = sim.forecast_a_distribution();
-    let (a_min, a_max) = (sim.params.a_min, sim.params.a_max);
-
-    let mut nodes = Vec::with_capacity(sim.agents.len());
-    let mut edges = Vec::new();
-    for (i, agent) in sim.agents.iter().enumerate() {
-        let belief = if agent.rules.is_empty() {
-            0.0
-        } else {
-            agent.rules.iter().map(|r| r.a).sum::<f64>() / agent.rules.len() as f64
-        };
-        nodes.push(NodeDto {
-            degree: sim.network.neighbors(i).len(),
-            belief,
-            demand: agent.demand,
-            accuracy: agent.mean_accuracy(),
-        });
-        for &j in sim.network.neighbors(i) {
-            if i < j {
-                edges.push([i, j]);
-            }
-        }
-    }
-
-    Snapshot {
-        period: sim.period(),
-        price: sim.price,
-        ree: sim.ree_price(),
-        rel_dev: sim.relative_deviation(),
-        ret_std: s.std,
-        kurtosis: s.excess_kurtosis,
-        ac1: s.autocorr1,
-        abs_ac1: s.abs_autocorr1,
-        tech_bits: sim.mean_technical_bits(),
-        prices: sim.price_history().iter().copied().collect(),
-        ree_series: sim.ree_history().iter().copied().collect(),
-        a_bins: histogram(&a_values, a_min, a_max, 40),
-        a_min,
-        a_max,
-        mean_degree: sim.network.mean_degree(),
-        max_degree: sim.network.max_degree(),
-        nodes,
-        edges,
-    }
-}
-
-/// Create (or replace) the live simulation and return its initial snapshot.
-#[tauri::command]
-fn init_sim(config: SimConfig, state: State<AppState>) -> Snapshot {
-    let sim = Simulation::new(build_params(&config));
-    let snap = make_snapshot(&sim);
-    *state.sim.lock().unwrap() = Some(sim);
-    snap
-}
-
-/// Advance the live simulation by `batch` periods and return a fresh snapshot.
-#[tauri::command]
-fn step_sim(batch: u32, state: State<AppState>) -> Result<Snapshot, String> {
-    let mut guard = state.sim.lock().unwrap();
-    let sim = guard.as_mut().ok_or("simulation not initialized")?;
-    for _ in 0..batch.max(1) {
-        sim.advance();
-    }
-    Ok(make_snapshot(sim))
-}
-
-/// Fetch a real company's daily price history (live, with offline fallback).
-#[tauri::command]
-fn fetch_real_market(symbol: Option<String>) -> MarketSeries {
-    let sym = symbol.unwrap_or_else(|| "AAPL".to_string());
-    market_data::load(&sym)
-}
-
-// --- volatility calibration ---
-// One simulation period := one trading day, so matching the sim's per-period
-// log-return std to real BTC's *daily* return std calibrates volatility.
-
-const CAL_WARMUP: u64 = 1200;
-const CAL_WINDOW: u64 = 1500;
-
-#[derive(Serialize)]
-struct Calibration {
-    sigma_eps: f64,
-    lambda: f64,
-    achieved_std: f64,
-    target_std: f64,
-    iterations: u32,
-    ok: bool,
-}
-
-/// Measure the simulated per-period log-return std for a given parameter set.
-fn measure_std(params: &Params) -> f64 {
-    let mut sim = Simulation::new(params.clone());
-    for t in 0..CAL_WARMUP {
-        sim.step(t);
-    }
-    let mut prev = sim.price;
-    let mut rets: Vec<f64> = Vec::with_capacity(CAL_WINDOW as usize);
-    for t in CAL_WARMUP..(CAL_WARMUP + CAL_WINDOW) {
-        sim.step(t);
-        let p = sim.price;
-        if prev > 0.0 && p > 0.0 {
-            rets.push((p / prev).ln());
-        }
-        prev = p;
-    }
-    if rets.len() < 2 {
-        return 0.0;
-    }
-    let n = rets.len() as f64;
-    let mean = rets.iter().sum::<f64>() / n;
-    let var = rets.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / n;
-    var.sqrt()
-}
-
-/// Largest `sigma_eps` that keeps the REE fundamental price comfortably positive
-/// (the risk-premium term grows as `sigma_eps^2` and otherwise drags it negative).
-fn safe_sigma_max(params: &Params) -> f64 {
-    let f = params.rho / (1.0 + params.r - params.rho);
-    // Keep premium <= 60% of the dividend term so the fundamental stays well above 0.
-    let num = 0.6 * (f + 1.0) * (1.0 - params.rho) * params.d_bar;
-    let den = (params.lambda * (f + 1.0) * (f + 1.0)).max(1e-9);
-    (num / den).max(1e-10).sqrt()
-}
-
-/// Calibrate volatility to `target_std` in two phases:
-///   1. Relax risk aversion `lambda` only until the target is reachable within
-///      the *stable* sigma range (bigger positions => more volatility headroom).
-///   2. Bisect `sigma_eps` in that range to hit the target precisely (volatility
-///      is monotonic in sigma there, and deterministic for a fixed seed).
-fn calibrate_core(mut params: Params, target_std: f64) -> Calibration {
-    let target = target_std.max(1e-6);
-    let mut iters = 0u32;
-
-    // Phase 1: secure enough headroom.
-    let mut smax = safe_sigma_max(&params);
-    for _ in 0..6 {
-        params.sigma_eps = smax;
-        iters += 1;
-        if measure_std(&params) >= target || params.lambda <= 0.031 {
-            break;
-        }
-        params.lambda = (params.lambda * 0.5).max(0.03);
-        smax = safe_sigma_max(&params);
-    }
-
-    // Phase 2: bisection on sigma_eps in (0, smax].
-    let mut lo = 1e-4_f64;
-    let mut hi = smax;
-    let mut achieved = 0.0;
-    for _ in 0..16 {
-        iters += 1;
-        let mid = 0.5 * (lo + hi);
-        params.sigma_eps = mid;
-        achieved = measure_std(&params);
-        if (achieved / target - 1.0).abs() < 0.05 {
-            break;
-        }
-        if achieved < target {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-
-    Calibration {
-        sigma_eps: params.sigma_eps,
-        lambda: params.lambda,
-        achieved_std: achieved,
-        target_std: target,
-        iterations: iters,
-        ok: (achieved / target - 1.0).abs() < 0.2,
-    }
-}
-
-/// Calibrate the simulated market's volatility to a target daily return std.
-#[tauri::command]
-fn calibrate(config: SimConfig, target_std: f64) -> Calibration {
-    calibrate_core(build_params(&config), target_std)
-}
-
-// --- Path-3 trading sandbox commands ---
+struct SandboxState(Mutex<Option<Live>>);
 
 #[derive(Deserialize)]
 struct CohortCfg {
@@ -327,6 +58,18 @@ struct SandboxCfg {
     /// Trading friction in basis points of turnover (default 0 = frictionless).
     #[serde(default)]
     cost_bps: Option<f64>,
+    /// "loop" | "bootstrap" | "stop" — what happens when the real data ends.
+    #[serde(default)]
+    replay: Option<String>,
+    /// Mean block length (days) for the bootstrap replay.
+    #[serde(default)]
+    block: Option<usize>,
+    /// "volatility" | "meanvariance"
+    #[serde(default)]
+    sizing: Option<String>,
+    /// Risk aversion for mean-variance sizing.
+    #[serde(default)]
+    gamma: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -346,20 +89,49 @@ struct TraderView {
     signals: u32,
     /// "trend" | "contrarian" | "drifter".
     kind: String,
+    max_drawdown: f64,
+    bust: bool,
+}
+
+#[derive(Serialize)]
+struct CohortStatsView {
+    name: String,
+    mean_wealth: f64,
+    median_wealth: f64,
+    excess_log_return: f64,
+    sharpe: f64,
+    max_drawdown: f64,
+    turnover: f64,
+    busts: usize,
 }
 
 #[derive(Serialize)]
 struct SandboxSnapshot {
     day: u64,
     idx: usize,
+    trading_days: u64,
     price: f64,
+    /// Simple return from the previous day on the path being played.
+    change: f64,
+    /// 0 = first pass over the real history.
+    pass: u32,
+    /// Today's price comes from a bootstrapped (synthetic) path.
+    synthetic: bool,
+    /// A "stop" run has used up its data.
+    finished: bool,
     sentiment: f64,
     herding: f64,
+    /// Mean position across traders (−1 all short … +1 all long).
+    net_position: f64,
     avg_wealth: f64,
     /// Passive buy-and-hold wealth over the same trading days (the baseline).
     benchmark_wealth: f64,
+    benchmark_sharpe: f64,
+    benchmark_max_drawdown: f64,
+    busts: usize,
     cohort_names: Vec<String>,
     cohort_wealth: Vec<f64>,
+    cohort_stats: Vec<CohortStatsView>,
     traders: Vec<TraderView>,
     // strategy mix
     trend_count: u32,
@@ -418,7 +190,33 @@ fn sandbox_params(cfg: &SandboxCfg) -> SandboxParams {
         Some("random") => Topology::Random { mean_degree: deg.max(0.0) },
         _ => Topology::ScaleFree { m: ((deg / 2.0).round() as usize).max(1) },
     };
+    p.replay = match cfg.replay.as_deref() {
+        Some("bootstrap") => Replay::Bootstrap { block: cfg.block.unwrap_or(20).clamp(1, 250) },
+        Some("stop") => Replay::Stop,
+        _ => Replay::Loop,
+    };
+    p.sizing = match cfg.sizing.as_deref() {
+        Some("meanvariance") => Sizing::MeanVariance { gamma: cfg.gamma.unwrap_or(3.0).clamp(0.1, 100.0) },
+        _ => Sizing::Volatility,
+    };
     p
+}
+
+fn cohorts_from(cfg: &SandboxCfg) -> Vec<Cohort> {
+    cfg.cohorts
+        .iter()
+        // Clamp to ranges the engine is stable in: memory > 1 would make the
+        // accuracy EMA negative, and an unbounded count can exhaust memory.
+        .map(|c| {
+            Cohort::new(
+                &c.name,
+                c.count.min(500),
+                c.memory.clamp(1e-4, 1.0),
+                c.herding.clamp(0.0, 1.0),
+                c.risk.clamp(0.0, 10.0),
+            )
+        })
+        .collect()
 }
 
 fn sandbox_snapshot(s: &Sandbox) -> SandboxSnapshot {
@@ -457,19 +255,46 @@ fn sandbox_snapshot(s: &Sandbox) -> SandboxSnapshot {
             accuracy: t.active_acc,
             signals: t.active_mask,
             kind: kind.to_string(),
+            max_drawdown: t.max_drawdown,
+            bust: t.bust,
         });
     }
+
+    let cohort_stats = o
+        .cohorts
+        .iter()
+        .map(|c| CohortStatsView {
+            name: c.name.clone(),
+            mean_wealth: c.mean_wealth,
+            median_wealth: c.median_wealth,
+            excess_log_return: c.excess_log_return,
+            sharpe: c.sharpe,
+            max_drawdown: c.max_drawdown,
+            turnover: c.turnover,
+            busts: c.busts,
+        })
+        .collect();
 
     SandboxSnapshot {
         day: o.day,
         idx: s.idx,
+        trading_days: o.trading_days,
         price: o.price,
+        change: s.change(),
+        pass: o.pass,
+        synthetic: o.synthetic,
+        finished: o.finished,
         sentiment: o.sentiment,
         herding: o.herding,
+        net_position: o.net_position,
         avg_wealth: o.avg_wealth,
         benchmark_wealth: o.benchmark_wealth,
+        benchmark_sharpe: o.benchmark_sharpe,
+        benchmark_max_drawdown: o.benchmark_max_drawdown,
+        busts: o.busts,
         cohort_names: o.cohort_names,
         cohort_wealth: o.cohort_wealth,
+        cohort_stats,
         traders,
         trend_count: trend,
         contrarian_count: contra,
@@ -479,14 +304,82 @@ fn sandbox_snapshot(s: &Sandbox) -> SandboxSnapshot {
     }
 }
 
+// --- run log (CSV export) ---
+
+struct LogRow {
+    day: u64,
+    pass: u32,
+    synthetic: bool,
+    price: f64,
+    sentiment: f64,
+    herding: f64,
+    net_position: f64,
+    avg_wealth: f64,
+    benchmark: f64,
+    cohort_wealth: Vec<f64>,
+}
+
+impl LogRow {
+    fn from(o: &Outcomes) -> Self {
+        Self {
+            day: o.day,
+            pass: o.pass,
+            synthetic: o.synthetic,
+            price: o.price,
+            sentiment: o.sentiment,
+            herding: o.herding,
+            net_position: o.net_position,
+            avg_wealth: o.avg_wealth,
+            benchmark: o.benchmark_wealth,
+            cohort_wealth: o.cohort_wealth.clone(),
+        }
+    }
+}
+
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn log_csv(cohorts: &[Cohort], rows: &[LogRow]) -> String {
+    let mut out = String::from("day,pass,synthetic,price,sentiment,herding,net_position,avg_wealth,buy_and_hold");
+    for c in cohorts {
+        out.push(',');
+        out.push_str(&csv_field(&format!("wealth_{}", c.name)));
+    }
+    out.push('\n');
+    for r in rows {
+        let _ = write!(
+            out,
+            "{},{},{},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4}",
+            r.day, r.pass, r.synthetic, r.price, r.sentiment, r.herding, r.net_position, r.avg_wealth, r.benchmark
+        );
+        for w in &r.cohort_wealth {
+            let _ = write!(out, ",{w:.4}");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// --- commands ---
+
 /// Start a sandbox run on a real company's price history with a cohort mix.
 ///
 /// `async` so the (up to 20 s) Yahoo fetch runs off the main thread instead of
 /// freezing the window; the blocking HTTP call is moved onto a blocking worker.
 #[tauri::command]
-async fn init_sandbox(config: SandboxCfg, state: State<'_, SandboxState>) -> Result<SandboxInit, String> {
+async fn init_sandbox(
+    app: AppHandle,
+    config: SandboxCfg,
+    state: State<'_, SandboxState>,
+) -> Result<SandboxInit, String> {
     let symbol = config.symbol.clone();
-    let series = tauri::async_runtime::spawn_blocking(move || market_data::load(&symbol))
+    let cache = app.path().app_cache_dir().ok().map(|d| d.join("market"));
+    let series = tauri::async_runtime::spawn_blocking(move || market_data::load(&symbol, cache.as_deref()))
         .await
         .map_err(|e| format!("market data task failed: {e}"))?;
     if series.prices.len() < 60 {
@@ -495,24 +388,19 @@ async fn init_sandbox(config: SandboxCfg, state: State<'_, SandboxState>) -> Res
     if config.cohorts.is_empty() {
         return Err("at least one cohort is required".into());
     }
-    let cohorts: Vec<Cohort> = config
-        .cohorts
-        .iter()
-        // Clamp to ranges the engine is stable in: memory > 1 would make the
-        // accuracy EMA negative, and an unbounded count can exhaust memory.
-        .map(|c| {
-            Cohort::new(
-                &c.name,
-                c.count.min(500),
-                c.memory.clamp(1e-4, 1.0),
-                c.herding.clamp(0.0, 1.0),
-                c.risk.clamp(0.0, 10.0),
-            )
-        })
-        .collect();
-    let sandbox = Sandbox::new(series.prices.clone(), cohorts, sandbox_params(&config));
+    let cohorts = cohorts_from(&config);
+    let params = sandbox_params(&config);
+    let sandbox = Sandbox::new(series.prices.clone(), cohorts.clone(), params.clone());
     let snapshot = sandbox_snapshot(&sandbox);
-    let init = SandboxInit {
+    *state.0.lock().map_err(|e| e.to_string())? = Some(Live {
+        sandbox,
+        symbol: series.symbol.clone(),
+        prices: series.prices.clone(),
+        cohorts,
+        params,
+        log: Vec::new(),
+    });
+    Ok(SandboxInit {
         symbol: series.symbol,
         name: series.name,
         source: series.source,
@@ -522,59 +410,154 @@ async fn init_sandbox(config: SandboxCfg, state: State<'_, SandboxState>) -> Res
         prices: series.prices,
         timestamps: series.timestamps,
         snapshot,
-    };
-    *state.0.lock().unwrap() = Some(sandbox);
-    Ok(init)
+    })
 }
 
 /// Advance the sandbox by `batch` trading days and return a fresh snapshot.
 #[tauri::command]
 fn step_sandbox(batch: u32, state: State<SandboxState>) -> Result<SandboxSnapshot, String> {
-    let mut guard = state.0.lock().unwrap();
-    let s = guard.as_mut().ok_or("sandbox not initialized")?;
-    for _ in 0..batch.max(1) {
-        s.step();
+    let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+    let live = guard.as_mut().ok_or("sandbox not initialized")?;
+    for _ in 0..batch.clamp(1, 1000) {
+        if live.sandbox.finished {
+            break;
+        }
+        live.sandbox.step();
+        if live.log.len() < LOG_CAP {
+            live.log.push(LogRow::from(&live.sandbox.outcomes()));
+        }
     }
-    Ok(sandbox_snapshot(s))
+    Ok(sandbox_snapshot(&live.sandbox))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Serialize)]
+struct CohortSweepView {
+    name: String,
+    excess_mean: f64,
+    excess_ci95: f64,
+    beat_fraction: f64,
+    sharpe_mean: f64,
+    max_drawdown_mean: f64,
+}
 
-    #[test]
-    fn calibration_hits_btc_like_volatility() {
-        // Complex regime, modest size for test speed.
-        let mut p = Params::complex();
-        p.n_agents = 40;
-        p.theta = 0.05;
-        p.spec_cost = 0.0;
-        p.social_prob = 0.4;
-        p.topology = Topology::Random { mean_degree: 6.0 };
-        p.seed = 1000;
+#[derive(Serialize)]
+struct SweepView {
+    seeds: usize,
+    days: u64,
+    benchmark_log_return: f64,
+    cohorts: Vec<CohortSweepView>,
+}
 
-        let target = 0.035; // ~3.5% daily, BTC-like
-        let cal = calibrate_core(p, target);
-        assert!(cal.sigma_eps.is_finite() && cal.sigma_eps > 0.0);
-        let err = (cal.achieved_std / target - 1.0).abs();
-        assert!(err < 0.20, "calibration off: achieved {} vs target {target}", cal.achieved_std);
+/// Re-run the current town (same data, guilds and settings) on `seeds`
+/// different seeds for one pass over the real history, and summarise how
+/// robust each guild's result is against buy-and-hold.
+#[tauri::command]
+async fn sweep_seeds(seeds: u32, state: State<'_, SandboxState>) -> Result<SweepView, String> {
+    let (prices, cohorts, params) = {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let live = guard.as_ref().ok_or("sandbox not initialized")?;
+        (live.prices.clone(), live.cohorts.clone(), live.params.clone())
+    };
+    let n = seeds.clamp(2, 256) as u64;
+    let days = prices.len().saturating_sub(1 + params.warmup).max(1) as u64;
+    // Seeds are offset from the live one so the sweep is reproducible per build.
+    let seed_list: Vec<u64> = (0..n).map(|i| params.seed.wrapping_add(i + 1)).collect();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        let p = SandboxParams { replay: Replay::Stop, ..params };
+        sweep(&prices, &cohorts, &p, &seed_list, days)
+    })
+    .await
+    .map_err(|e| format!("sweep failed: {e}"))?;
+    Ok(SweepView {
+        seeds: summary.seeds,
+        days: summary.days,
+        benchmark_log_return: summary.benchmark_log_return,
+        cohorts: summary
+            .cohorts
+            .into_iter()
+            .map(|c| CohortSweepView {
+                name: c.name,
+                excess_mean: c.excess_mean,
+                excess_ci95: c.excess_ci95,
+                beat_fraction: c.beat_fraction,
+                sharpe_mean: c.sharpe_mean,
+                max_drawdown_mean: c.max_drawdown_mean,
+            })
+            .collect(),
+    })
+}
+
+/// Write the run so far as CSV into the user's Downloads folder (or the app
+/// data folder if there is none) and return the file path.
+#[tauri::command]
+fn export_run(app: AppHandle, state: State<SandboxState>) -> Result<String, String> {
+    let guard = state.0.lock().map_err(|e| e.to_string())?;
+    let live = guard.as_ref().ok_or("sandbox not initialized")?;
+    if live.log.is_empty() {
+        return Err("nothing to export yet — run the town first".into());
     }
+    let dir = app.path().download_dir().or_else(|_| app.path().app_data_dir()).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let safe_symbol: String = live.symbol.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let path = dir.join(format!("trading-town_{}_seed{}_day{}.csv", safe_symbol, live.params.seed, live.sandbox.day));
+    std::fs::write(&path, log_csv(&live.cohorts, &live.log)).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState::default())
         .manage(SandboxState::default())
-        .invoke_handler(tauri::generate_handler![
-            init_sim,
-            step_sim,
-            fetch_real_market,
-            calibrate,
-            init_sandbox,
-            step_sandbox
-        ])
+        .invoke_handler(tauri::generate_handler![init_sandbox, step_sandbox, sweep_seeds, export_run])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(json: &str) -> SandboxCfg {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn params_parse_replay_and_sizing() {
+        let p = sandbox_params(&cfg(
+            r#"{"symbol":"AAPL","cohorts":[],"replay":"bootstrap","block":10,"sizing":"meanvariance","gamma":5,"cost_bps":9999}"#,
+        ));
+        assert_eq!(p.replay, Replay::Bootstrap { block: 10 });
+        assert_eq!(p.sizing, Sizing::MeanVariance { gamma: 5.0 });
+        assert_eq!(p.cost_bps, 500.0, "cost is clamped");
+        let d = sandbox_params(&cfg(r#"{"symbol":"AAPL","cohorts":[]}"#));
+        assert_eq!(d.replay, Replay::Loop);
+        assert_eq!(d.sizing, Sizing::Volatility);
+    }
+
+    #[test]
+    fn cohorts_are_clamped() {
+        let c = cohorts_from(&cfg(
+            r#"{"symbol":"AAPL","cohorts":[{"name":"x","count":99999,"memory":5,"herding":-1,"risk":50}]}"#,
+        ));
+        assert_eq!(c[0].count, 500);
+        assert_eq!((c[0].memory, c[0].herding, c[0].risk), (1.0, 0.0, 10.0));
+    }
+
+    #[test]
+    fn csv_has_header_and_one_row_per_day() {
+        let cohorts = vec![Cohort::new("Calm", 5, 0.03, 0.1, 1.0), Cohort::new("A, \"B\"", 5, 0.03, 0.1, 1.0)];
+        let prices: Vec<f64> = (0..120).map(|i| 100.0 + i as f64).collect();
+        let mut s = Sandbox::new(prices, cohorts.clone(), SandboxParams::default());
+        let mut rows = Vec::new();
+        for _ in 0..10 {
+            s.step();
+            rows.push(LogRow::from(&s.outcomes()));
+        }
+        let csv = log_csv(&cohorts, &rows);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 11);
+        assert!(lines[0].ends_with(",wealth_Calm,\"wealth_A, \"\"B\"\"\""));
+        assert_eq!(lines[1].split(',').count(), 11);
+    }
 }

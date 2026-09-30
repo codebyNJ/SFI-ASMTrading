@@ -2,8 +2,10 @@
 //!
 //! In the Path-3 sandbox this real price series *drives* the simulation: it plays
 //! forward day by day and the agents react to it. We fetch live (no API key, just
-//! a browser User-Agent) and fall back to a bundled snapshot when offline.
+//! a browser User-Agent), cache every successful fetch on disk, and when offline
+//! fall back to that cache and then to a bundled snapshot.
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -11,13 +13,14 @@ use serde_json::Value;
 
 /// Offline fallback (Apple, ~5y daily) so the app always has a series to play.
 const BUNDLED_AAPL: &str = include_str!("../resources/stock_aapl.json");
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
+const UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
 #[derive(Serialize, Clone)]
 pub struct MarketSeries {
     pub symbol: String,
     pub name: String,
-    /// "yahoo" | "bundled"
+    /// "yahoo" | "cache" | "bundled"
     pub source: String,
     /// The ticker the user asked for. Differs from `symbol` when the live fetch
     /// failed and the bundled AAPL snapshot was substituted.
@@ -46,25 +49,14 @@ pub struct MarketSeries {
 }
 
 fn http_get(url: &str) -> Option<String> {
-    ureq::get(url)
-        .set("User-Agent", UA)
-        .timeout(Duration::from_secs(20))
-        .call()
-        .ok()?
-        .into_string()
-        .ok()
+    ureq::get(url).set("User-Agent", UA).timeout(Duration::from_secs(20)).call().ok()?.into_string().ok()
 }
 
 /// Parse Yahoo's chart JSON into (timestamps, closes), dropping null gaps.
 fn parse_yahoo(body: &str) -> Option<(String, Vec<i64>, Vec<f64>)> {
     let v: Value = serde_json::from_str(body).ok()?;
     let result = v.get("chart")?.get("result")?.get(0)?;
-    let symbol = result
-        .get("meta")
-        .and_then(|m| m.get("symbol"))
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
+    let symbol = result.get("meta").and_then(|m| m.get("symbol")).and_then(|s| s.as_str()).unwrap_or("").to_string();
     let ts = result.get("timestamp")?.as_array()?;
     let close = result.get("indicators")?.get("quote")?.get(0)?.get("close")?.as_array()?;
 
@@ -83,7 +75,12 @@ fn parse_yahoo(body: &str) -> Option<(String, Vec<i64>, Vec<f64>)> {
 
 /// Parse the bundled `{symbol,name,t:[],c:[]}` snapshot.
 fn parse_bundled() -> Option<(String, String, Vec<i64>, Vec<f64>)> {
-    let v: Value = serde_json::from_str(BUNDLED_AAPL).ok()?;
+    parse_snapshot(BUNDLED_AAPL)
+}
+
+/// Parse a `{symbol,name,t:[],c:[]}` snapshot (bundled or cached).
+fn parse_snapshot(json: &str) -> Option<(String, String, Vec<i64>, Vec<f64>)> {
+    let v: Value = serde_json::from_str(json).ok()?;
     let symbol = v.get("symbol")?.as_str()?.to_string();
     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
     let t: Vec<i64> = v.get("t")?.as_array()?.iter().filter_map(|x| x.as_i64()).collect();
@@ -102,14 +99,38 @@ pub fn sanitize_symbol(symbol: &str) -> Option<String> {
     ok.then_some(sym)
 }
 
-/// Load a daily series for `symbol`, live from Yahoo with a bundled fallback.
-pub fn load(symbol: &str) -> MarketSeries {
+fn cache_file(dir: &Path, sym: &str) -> std::path::PathBuf {
+    dir.join(format!("{sym}.json"))
+}
+
+/// Best-effort write of a fetched series to the on-disk cache.
+fn write_cache(dir: &Path, sym: &str, name: &str, t: &[i64], c: &[f64]) {
+    let body = serde_json::json!({ "symbol": sym, "name": name, "t": t, "c": c });
+    if std::fs::create_dir_all(dir).is_ok() {
+        let _ = std::fs::write(cache_file(dir, sym), body.to_string());
+    }
+}
+
+fn read_cache(dir: &Path, sym: &str) -> Option<(String, String, Vec<i64>, Vec<f64>)> {
+    let json = std::fs::read_to_string(cache_file(dir, sym)).ok()?;
+    parse_snapshot(&json).filter(|(s, _, _, c)| s == sym && c.len() >= 60)
+}
+
+/// Load a daily series for `symbol`: live from Yahoo, else the last cached
+/// fetch of that symbol (when `cache_dir` is given), else the bundled AAPL.
+pub fn load(symbol: &str, cache_dir: Option<&Path>) -> MarketSeries {
     let requested = symbol.trim().to_uppercase();
     if let Some(sym) = sanitize_symbol(symbol) {
         let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5y&interval=1d");
         if let Some((ysym, t, c)) = http_get(&url).and_then(|b| parse_yahoo(&b)) {
             let name = if ysym.is_empty() { sym.clone() } else { ysym };
+            if let Some(dir) = cache_dir {
+                write_cache(dir, &sym, &name, &t, &c);
+            }
             return compute(&sym, &name, "yahoo", &requested, t, c);
+        }
+        if let Some((csym, cname, t, c)) = cache_dir.and_then(|d| read_cache(d, &sym)) {
+            return compute(&csym, &cname, "cache", &requested, t, c);
         }
     }
     if let Some((bsym, bname, t, c)) = parse_bundled() {
@@ -221,6 +242,18 @@ mod tests {
         let m = compute("AAPL", "Apple Inc.", "bundled", "MSFT", t, c);
         assert!(m.fallback);
         assert_eq!(m.requested, "MSFT");
+    }
+
+    #[test]
+    fn cache_round_trips_and_rejects_other_symbols() {
+        let dir = std::env::temp_dir().join(format!("tt-cache-test-{}", std::process::id()));
+        let (_, _, t, c) = parse_bundled().unwrap();
+        write_cache(&dir, "MSFT", "Microsoft", &t, &c);
+        let (sym, name, t2, c2) = read_cache(&dir, "MSFT").expect("cached series should load");
+        assert_eq!((sym.as_str(), name.as_str()), ("MSFT", "Microsoft"));
+        assert_eq!((t2, c2), (t, c));
+        assert!(read_cache(&dir, "NVDA").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
