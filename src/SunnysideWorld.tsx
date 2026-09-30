@@ -1,4 +1,7 @@
 import { useEffect, useRef } from "react";
+// Swaps Pixi's runtime shader/uniform code generation for precompiled versions,
+// so the world renders under the app's strict Content-Security-Policy (no eval).
+import "pixi.js/unsafe-eval";
 import {
   AnimatedSprite,
   Application,

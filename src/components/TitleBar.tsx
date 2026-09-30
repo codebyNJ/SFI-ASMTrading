@@ -10,8 +10,14 @@ export function TitleBar(props: {
   change: number;
   /** Set when live data failed and a bundled series was substituted. */
   fallbackFor?: string;
+  /** Live data failed but an earlier download of this ticker was used. */
+  cached?: boolean;
+  /** 0 = first pass over the real history. */
+  pass?: number;
+  /** Today's price comes from a bootstrapped path, not the real history. */
+  synthetic?: boolean;
 }) {
-  const { name, symbol, day, days, price, change, fallbackFor } = props;
+  const { name, symbol, day, days, price, change, fallbackFor, cached, pass = 0, synthetic } = props;
   const up = change >= 0;
   return (
     <div data-tauri-drag-region className="titlebar flex h-9 shrink-0 items-center justify-between px-3 select-none">
@@ -30,6 +36,23 @@ export function TitleBar(props: {
             title={`Couldn't load ${fallbackFor} (offline or unknown ticker) — showing the bundled ${symbol} sample instead.`}
           >
             ⚠ {fallbackFor} unavailable · offline sample
+          </span>
+        )}
+        {cached && !fallbackFor && (
+          <span className="rounded-md bg-secondary px-1.5 py-0.5 text-[11px]" title="Offline — using the last downloaded copy of this ticker.">
+            cached data
+          </span>
+        )}
+        {pass > 0 && (
+          <span
+            className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${synthetic ? "bg-violet-100 text-violet-800" : "bg-amber-100 text-amber-800"}`}
+            title={
+              synthetic
+                ? "The real history has ended. Prices now come from a resampled (block-bootstrapped) path with the same volatility, not real data."
+                : "Replaying the same history: traders have already learned on it, so results from here are in-sample."
+            }
+          >
+            {synthetic ? `synthetic pass ${pass}` : `replay ${pass} · in-sample`}
           </span>
         )}
         <span>· Day {day} / {days} ·</span>

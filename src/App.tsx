@@ -1,25 +1,31 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Pause, RotateCcw, ChevronDown, ChevronRight } from "lucide-react";
+import { Play, Pause, RotateCcw, ChevronDown, ChevronRight, Download, FlaskConical } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Select } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { COHORT_PRESETS, COMPANIES, TOPOLOGIES, type CohortPreset } from "@/data/presets";
+import { COHORT_PRESETS, COMPANIES, REPLAY_MODES, SIZING_MODES, TOPOLOGIES, type CohortPreset } from "@/data/presets";
 import SunnysideWorld, { type CohortView } from "@/SunnysideWorld";
 import { TitleBar } from "@/components/TitleBar";
 import { FloatingPanel } from "@/components/FloatingPanel";
 import { Insights } from "@/components/Insights";
 import { TraderInspector } from "@/components/TraderInspector";
-import type { Snapshot, Init } from "@/types";
+import { pushCapped, stepPlan } from "@/lib/pacing";
+import type { Snapshot, Init, MarketHistory, Sweep } from "@/types";
 
-const DEFAULT_COUNTS: Record<string, number> = { value: 8, calm: 10, bubbly: 10, herder: 8, reckless: 4 };
+const DEFAULT_COUNTS: Record<string, number> = { patient: 8, calm: 10, bubbly: 10, herder: 8, reckless: 4 };
 const HIST_CAP = 400;
+const SWEEP_SEEDS = 16;
+const EMPTY_MARKET: MarketHistory = { price: [], net: [], synthetic: [] };
 
 function App() {
   const [symbol, setSymbol] = useState("AAPL");
   const [counts, setCounts] = useState<Record<string, number>>(DEFAULT_COUNTS);
   const [topology, setTopology] = useState("scalefree");
+  const [replay, setReplay] = useState("bootstrap");
+  const [sizing, setSizing] = useState("volatility");
+  const [costBps, setCostBps] = useState(5);
   const [speed, setSpeed] = useState(1.5);
   const [seed, setSeed] = useState(1000);
   const [advanced, setAdvanced] = useState(false);
@@ -29,8 +35,12 @@ function App() {
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [history, setHistory] = useState<number[][]>([]);
+  const [market, setMarket] = useState<MarketHistory>(EMPTY_MARKET);
+  const [sweep, setSweep] = useState<Sweep | null>(null);
+  const [sweeping, setSweeping] = useState(false);
 
   const speedRef = useRef(speed);
   speedRef.current = speed;
@@ -41,19 +51,22 @@ function App() {
   const cohortViews: CohortView[] = active.map((p) => ({ name: p.name, color: p.color, herding: p.herding }));
   const guilds = active.map((p) => ({ name: p.name, color: p.color }));
 
-  const idx = snap?.idx ?? 0;
-  const change = init && idx > 0 && idx < init.prices.length ? (init.prices[idx] - init.prices[idx - 1]) / init.prices[idx - 1] : 0;
+  const change = snap?.change ?? 0;
 
   async function build() {
     setRunning(false);
     setBusy(true);
     setSelected(null);
     setHistory(active.map(() => []));
+    setMarket(EMPTY_MARKET);
+    setSweep(null);
     lastHistDay.current = -1;
     setError(null);
+    setNotice(null);
     try {
       const cohorts = active.map((p) => ({ name: p.name, count: counts[p.key], memory: p.memory, herding: p.herding, risk: p.risk }));
-      const res = await invoke<Init>("init_sandbox", { config: { symbol, cohorts, topology, degree: 6, seed } });
+      const config = { symbol, cohorts, topology, degree: 6, seed, replay, sizing, cost_bps: costBps };
+      const res = await invoke<Init>("init_sandbox", { config });
       setInit(res);
       setSnap(res.snapshot);
     } catch (e) {
@@ -61,6 +74,28 @@ function App() {
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function runSweep() {
+    setSweeping(true);
+    setError(null);
+    try {
+      setSweep(await invoke<Sweep>("sweep_seeds", { seeds: SWEEP_SEEDS }));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSweeping(false);
+    }
+  }
+
+  async function exportRun() {
+    setError(null);
+    try {
+      const path = await invoke<string>("export_run");
+      setNotice(`Saved ${path}`);
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -75,17 +110,23 @@ function App() {
     let timer = 0;
     const tick = async () => {
       if (!on) return;
+      const { batch, intervalMs } = stepPlan(speedRef.current);
       try {
-        const s = await invoke<Snapshot>("step_sandbox", { batch: 1 });
+        const s = await invoke<Snapshot>("step_sandbox", { batch });
         if (!on) return;
         setSnap(s);
+        if (s.finished) {
+          setRunning(false);
+          setNotice("Reached the end of the real data. Build again, or pick another replay mode under Advanced.");
+          return;
+        }
       } catch (e) {
         console.error(e);
         setError(String(e));
         setRunning(false);
         return;
       }
-      timer = window.setTimeout(tick, 1000 / Math.max(0.2, speedRef.current));
+      timer = window.setTimeout(tick, intervalMs);
     };
     tick();
     return () => {
@@ -94,17 +135,16 @@ function App() {
     };
   }, [running]);
 
-  // accumulate per-guild wealth history on each new day
+  // accumulate per-guild wealth and market history on each new day
   useEffect(() => {
     if (!snap || snap.day === lastHistDay.current) return;
     lastHistDay.current = snap.day;
-    setHistory((h) => {
-      const next = snap.cohort_wealth.map((w, i) => {
-        const s = (h[i] ?? []).concat(w);
-        return s.length > HIST_CAP ? s.slice(s.length - HIST_CAP) : s;
-      });
-      return next;
-    });
+    setHistory((h) => snap.cohort_wealth.map((w, i) => pushCapped(h[i] ?? [], w, HIST_CAP)));
+    setMarket((m) => ({
+      price: pushCapped(m.price, snap.price, HIST_CAP),
+      net: pushCapped(m.net, snap.net_position, HIST_CAP),
+      synthetic: m.synthetic.concat(snap.synthetic).slice(-HIST_CAP),
+    }));
   }, [snap]);
 
   const selTrader = selected != null && snap && selected < snap.traders.length ? snap.traders[selected] : null;
@@ -112,7 +152,18 @@ function App() {
 
   return (
     <div className="flex h-screen flex-col">
-      <TitleBar name={init?.name} symbol={init?.symbol} day={snap ? snap.idx + 1 : 0} days={init?.days ?? 0} price={snap?.price ?? 0} change={change} fallbackFor={init?.fallback ? init.requested : undefined} />
+      <TitleBar
+        name={init?.name}
+        symbol={init?.symbol}
+        day={snap ? snap.idx + 1 : 0}
+        days={init?.days ?? 0}
+        price={snap?.price ?? 0}
+        change={change}
+        fallbackFor={init?.fallback ? init.requested : undefined}
+        cached={init?.source === "cache"}
+        pass={snap?.pass ?? 0}
+        synthetic={snap?.synthetic ?? false}
+      />
 
       <div className="flex min-h-0 flex-1">
         {/* Town */}
@@ -145,15 +196,32 @@ function App() {
                 <Button variant="secondary" className="flex-1" onClick={build} disabled={busy || total < 1}>
                   <RotateCcw className="h-4 w-4" /> Build
                 </Button>
-                <Button className="flex-1" onClick={() => setRunning((r) => !r)} disabled={!snap}>
+                <Button className="flex-1" onClick={() => setRunning((r) => !r)} disabled={!snap || snap.finished}>
                   {running ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
                   {running ? "Pause" : "Run"}
                 </Button>
               </div>
 
               {error && <p className="rounded-md bg-red-50 px-2 py-1 text-[11px] text-red-700">{error}</p>}
+              {notice && <p className="break-all rounded-md bg-sky-50 px-2 py-1 text-[11px] text-sky-800">{notice}</p>}
 
-              <LabeledSlider label="Speed (days / sec)" value={speed} min={0.3} max={6} step={0.1} onChange={setSpeed} />
+              <LabeledSlider
+                label={speed > 6 ? "Speed (days / sec) · fast-forward" : "Speed (days / sec)"}
+                value={speed}
+                min={0.3}
+                max={60}
+                step={0.1}
+                onChange={setSpeed}
+              />
+
+              <div className="flex gap-2">
+                <Button variant="secondary" className="flex-1" onClick={runSweep} disabled={!snap || sweeping || running}>
+                  <FlaskConical className="h-4 w-4" /> {sweeping ? "Testing…" : `Test ${SWEEP_SEEDS} seeds`}
+                </Button>
+                <Button variant="secondary" className="flex-1" onClick={exportRun} disabled={!snap || snap.trading_days === 0}>
+                  <Download className="h-4 w-4" /> Export CSV
+                </Button>
+              </div>
 
               <div className="border-t pt-2">
                 <div className="mb-1 text-[11px] text-muted-foreground">Compose the town · {total} traders</div>
@@ -169,18 +237,12 @@ function App() {
               </button>
               {advanced && (
                 <div className="space-y-3 border-t pt-2">
-                  <div className="space-y-1">
-                    <span className="text-[11px] text-muted-foreground">Social structure</span>
-                    <Select value={topology} onChange={(e) => setTopology(e.target.value)}>
-                      {TOPOLOGIES.map((t) => (
-                        <option key={t.key} value={t.key}>
-                          {t.label}
-                        </option>
-                      ))}
-                    </Select>
-                  </div>
+                  <LabeledSelect label="When the real data runs out" value={replay} onChange={setReplay} options={REPLAY_MODES} />
+                  <LabeledSelect label="Bet sizing" value={sizing} onChange={setSizing} options={SIZING_MODES} />
+                  <LabeledSlider label="Trading cost (bps of turnover)" value={costBps} min={0} max={50} step={1} onChange={setCostBps} />
+                  <LabeledSelect label="Social structure" value={topology} onChange={setTopology} options={TOPOLOGIES} />
                   <LabeledSlider label="Random seed" value={seed} min={1} max={9999} step={1} onChange={setSeed} />
-                  <p className="text-[10px] leading-snug text-muted-foreground">Press Build after changing guilds, company, or structure.</p>
+                  <p className="text-[10px] leading-snug text-muted-foreground">Press Build after changing guilds, company, or any setting here.</p>
                 </div>
               )}
             </div>
@@ -196,7 +258,7 @@ function App() {
 
         {/* Insights */}
         <div className="w-[344px] shrink-0 overflow-hidden border-l bg-background p-2">
-          <Insights snap={snap} guilds={guilds} history={history} />
+          <Insights snap={snap} guilds={guilds} history={history} market={market} sweep={sweep} />
         </div>
       </div>
     </div>
@@ -208,7 +270,7 @@ function CohortRow(props: { p: CohortPreset; value: number; onChange: (v: number
   return (
     <div className="space-y-1">
       <div className="flex items-center justify-between">
-        <span className="flex items-center gap-1.5 text-[13px]">
+        <span className="flex items-center gap-1.5 text-[13px]" title={p.blurb}>
           <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: p.color }} />
           {p.name}
         </span>
@@ -227,6 +289,21 @@ function LabeledSlider(props: { label: string; value: number; min: number; max: 
         <span className="tabular-nums">{props.value}</span>
       </div>
       <Slider value={[props.value]} min={props.min} max={props.max} step={props.step} onValueChange={(v) => props.onChange(v[0])} />
+    </div>
+  );
+}
+
+function LabeledSelect(props: { label: string; value: string; onChange: (v: string) => void; options: { key: string; label: string }[] }) {
+  return (
+    <div className="space-y-1">
+      <span className="text-[11px] text-muted-foreground">{props.label}</span>
+      <Select value={props.value} onChange={(e) => props.onChange(e.target.value)}>
+        {props.options.map((o) => (
+          <option key={o.key} value={o.key}>
+            {o.label}
+          </option>
+        ))}
+      </Select>
     </div>
   );
 }

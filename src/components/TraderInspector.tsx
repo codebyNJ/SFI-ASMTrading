@@ -14,9 +14,14 @@ export function TraderInspector(props: { trader: Trader; cohortName: string; col
         <span className="ml-auto rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium">{KIND_LABEL[t.kind] ?? t.kind}</span>
       </div>
 
-      <div className="grid grid-cols-2 gap-2">
+      {t.bust && (
+        <div className="rounded-md bg-red-50 px-2 py-1 text-[11px] text-red-700">Bankrupt — no longer trades, and neighbours no longer copy its rules.</div>
+      )}
+
+      <div className="grid grid-cols-3 gap-2">
         <Field label="Wealth" value={money(t.wealth)} tone={t.wealth >= 1000 ? "up" : "down"} />
         <Field label="Today" value={`${(t.pnl * 100).toFixed(2)}%`} tone={t.pnl >= 0 ? "up" : "down"} />
+        <Field label="Max drawdown" value={`${Math.round(t.max_drawdown * 100)}%`} tone={t.max_drawdown > 0.3 ? "down" : undefined} />
       </div>
 
       <div>

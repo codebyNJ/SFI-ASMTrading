@@ -1,19 +1,110 @@
 import { useEffect, useRef } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { type Snapshot, SIGNAL_LABELS, money } from "@/types";
+import { type MarketHistory, type Snapshot, type Sweep, SIGNAL_LABELS, money } from "@/types";
+import { ciVerdict, excessPct } from "@/lib/format";
 
 type Guild = { name: string; color: string };
 
-export function Insights(props: { snap: Snapshot | null; guilds: Guild[]; history: number[][] }) {
-  const { snap, guilds, history } = props;
+export function Insights(props: { snap: Snapshot | null; guilds: Guild[]; history: number[][]; market: MarketHistory; sweep: Sweep | null }) {
+  const { snap, guilds, history, market, sweep } = props;
   return (
     <div className="flex h-full flex-col gap-2 overflow-y-auto pr-0.5">
       <TownMood snap={snap} />
+      <MarketChart market={market} />
+      <Leaderboard snap={snap} guilds={guilds} history={history} />
+      {sweep && <Robustness sweep={sweep} guilds={guilds} />}
       <StrategyMix snap={snap} />
       <BeliefSpread snap={snap} />
       <SignalUsage snap={snap} />
-      <Leaderboard snap={snap} guilds={guilds} history={history} />
     </div>
+  );
+}
+
+function MarketChart(props: { market: MarketHistory }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const { price, net, synthetic } = props.market;
+  useEffect(() => {
+    const c = ref.current;
+    if (!c) return;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (w === 0 || h === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    c.width = w * dpr; c.height = h * dpr;
+    const ctx = c.getContext("2d")!;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (price.length < 2) return;
+    const n = price.length;
+    const x = (i: number) => (i / (n - 1)) * w;
+    // Town positioning as bars around the midline: green = net long, red = net short.
+    const mid = h / 2;
+    const bw = Math.max(1, w / n);
+    net.forEach((v, i) => {
+      ctx.fillStyle = v >= 0 ? "rgba(34,197,94,0.28)" : "rgba(239,68,68,0.28)";
+      const bh = Math.min(1, Math.abs(v)) * (h / 2);
+      ctx.fillRect(x(i) - bw / 2, v >= 0 ? mid - bh : mid, bw, bh);
+    });
+    let lo = Infinity, hi = -Infinity;
+    for (const p of price) { lo = Math.min(lo, p); hi = Math.max(hi, p); }
+    const pad = (hi - lo) * 0.08 || 1; lo -= pad; hi += pad;
+    const y = (p: number) => h - ((p - lo) / (hi - lo)) * h;
+    ctx.lineWidth = 1.5;
+    for (let i = 1; i < n; i++) {
+      ctx.strokeStyle = synthetic[i] ? "#7c3aed" : "#0f172a";
+      ctx.beginPath();
+      ctx.moveTo(x(i - 1), y(price[i - 1]));
+      ctx.lineTo(x(i), y(price[i]));
+      ctx.stroke();
+    }
+  }, [price, net, synthetic]);
+  return (
+    <Card>
+      <CardHeader className="pb-1">
+        <CardTitle>Market &amp; the crowd</CardTitle>
+        <span className="text-[11px] text-muted-foreground">price · bars = town net long / short{synthetic.some(Boolean) ? " · purple = synthetic" : ""}</span>
+      </CardHeader>
+      <CardContent>
+        <canvas ref={ref} className="h-24 w-full" />
+      </CardContent>
+    </Card>
+  );
+}
+
+function Robustness(props: { sweep: Sweep; guilds: Guild[] }) {
+  const { sweep, guilds } = props;
+  const label = { beats: "beats B&H", lags: "lags B&H", unclear: "no clear edge" } as const;
+  const tone = { beats: "text-emerald-600", lags: "text-red-600", unclear: "text-muted-foreground" } as const;
+  return (
+    <Card>
+      <CardHeader className="pb-1">
+        <CardTitle>Is it luck? · {sweep.seeds} seeds</CardTitle>
+        <span className="text-[11px] text-muted-foreground">
+          one pass over the real {sweep.days} days · wealth vs buy &amp; hold, mean ± 95% CI
+        </span>
+      </CardHeader>
+      <CardContent className="space-y-1.5">
+        {sweep.cohorts.map((c, i) => {
+          const v = ciVerdict(c.excess_mean, c.excess_ci95);
+          return (
+            <div key={c.name} className="flex items-center justify-between gap-2 text-[12px]">
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: guilds[i]?.color ?? "#888" }} />
+                {c.name}
+              </span>
+              <span className="tabular-nums text-muted-foreground" title="Final wealth relative to buy & hold (95% CI across seeds)">
+                {excessPct(c.excess_mean)} <span className="text-[10px]">[{excessPct(c.excess_mean - c.excess_ci95)}, {excessPct(c.excess_mean + c.excess_ci95)}]</span>
+              </span>
+              <span className={`w-20 text-right text-[11px] ${tone[v]}`} title={`${Math.round(c.beat_fraction * 100)}% of seeds ahead of buy & hold`}>
+                {label[v]}
+              </span>
+            </div>
+          );
+        })}
+        <p className="pt-1 text-[10px] leading-snug text-muted-foreground">
+          "No clear edge" means the interval includes zero: the difference could be down to the random seed.
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -113,34 +204,62 @@ function SignalUsage(props: { snap: Snapshot | null }) {
 
 function Leaderboard(props: { snap: Snapshot | null; guilds: Guild[]; history: number[][] }) {
   const { snap, guilds, history } = props;
+  const bench = snap?.benchmark_wealth ?? 1000;
   const ranked = guilds
-    .map((g, i) => ({ ...g, wealth: snap?.cohort_wealth[i] ?? 1000, i }))
+    .map((g, i) => ({ ...g, wealth: snap?.cohort_wealth[i] ?? 1000, stats: snap?.cohort_stats[i], i }))
     .sort((a, b) => b.wealth - a.wealth);
   return (
     <Card className="flex-1">
       <CardHeader className="pb-1">
         <CardTitle>Who's winning</CardTitle>
-        <span className="text-[11px] text-muted-foreground">guild wealth over the run</span>
+        <span className="text-[11px] text-muted-foreground">guild wealth over the run, vs simply holding the stock</span>
       </CardHeader>
       <CardContent className="space-y-2">
         <Sparklines history={history} colors={guilds.map((g) => g.color)} />
-        {snap && (
-          <div className="flex items-center justify-between border-b border-dashed pb-1.5 text-[12px] text-muted-foreground">
-            <span title="What you'd have by simply holding the stock over the same days">Buy &amp; hold (baseline)</span>
-            <span className="tabular-nums">{money(snap.benchmark_wealth)}</span>
-          </div>
-        )}
-        {ranked.map((g) => (
-          <div key={g.i} className="flex items-center justify-between text-[12px]">
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: g.color }} />
-              {g.name}
-            </span>
-            <span className={`tabular-nums ${g.wealth >= 1000 ? "text-emerald-600" : "text-red-600"}`}>{money(g.wealth)}</span>
-          </div>
-        ))}
+        <div className="grid grid-cols-[1fr_auto_auto_auto_auto] items-center gap-x-2 gap-y-1 text-[12px]">
+          <span />
+          <span className="text-right text-[10px] text-muted-foreground" title="Mean wealth (median in brackets)">wealth</span>
+          <span className="text-right text-[10px] text-muted-foreground" title="Mean wealth relative to buy & hold">vs B&amp;H</span>
+          <span className="text-right text-[10px] text-muted-foreground" title="Annualised Sharpe ratio of the guild's pooled daily returns">Sharpe</span>
+          <span className="text-right text-[10px] text-muted-foreground" title="Worst peak-to-trough fall of the guild's pooled wealth">max DD</span>
+          {ranked.map((g) => (
+            <GuildRow key={g.i} g={g} bench={bench} />
+          ))}
+          {snap && (
+            <>
+              <span className="text-muted-foreground" title="What you'd have by simply holding the stock over the same days">Buy &amp; hold</span>
+              <span className="text-right tabular-nums text-muted-foreground">{money(snap.benchmark_wealth)}</span>
+              <span />
+              <span className="text-right tabular-nums text-muted-foreground">{snap.benchmark_sharpe.toFixed(2)}</span>
+              <span className="text-right tabular-nums text-muted-foreground">{Math.round(snap.benchmark_max_drawdown * 100)}%</span>
+            </>
+          )}
+        </div>
+        {snap && snap.busts > 0 && <p className="text-[10px] text-red-600">{snap.busts} trader{snap.busts === 1 ? "" : "s"} bankrupt</p>}
       </CardContent>
     </Card>
+  );
+}
+
+function GuildRow(props: {
+  g: Guild & { wealth: number; stats?: Snapshot["cohort_stats"][number] };
+  bench: number;
+}) {
+  const { g, bench } = props;
+  const s = g.stats;
+  const ahead = g.wealth >= bench;
+  return (
+    <>
+      <span className="flex items-center gap-1.5 truncate">
+        <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: g.color }} />
+        {g.name}
+        {s && s.busts > 0 && <span className="text-[10px] text-red-600">†{s.busts}</span>}
+      </span>
+      <span className="text-right tabular-nums" title={s ? `median ${money(s.median_wealth)}` : undefined}>{money(g.wealth)}</span>
+      <span className={`text-right tabular-nums ${ahead ? "text-emerald-600" : "text-red-600"}`}>{s ? excessPct(s.excess_log_return) : "—"}</span>
+      <span className="text-right tabular-nums">{s ? s.sharpe.toFixed(2) : "—"}</span>
+      <span className="text-right tabular-nums">{s ? `${Math.round(s.max_drawdown * 100)}%` : "—"}</span>
+    </>
   );
 }
 
